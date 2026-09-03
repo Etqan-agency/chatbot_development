@@ -1,0 +1,6 @@
+[submodule "chatbot_api"]
+	path = chatbot_api
+	url = git@github.com:Etqan-agency/chatbot_api.git
+[submodule "chatbot_dashboard"]
+	path = chatbot_dashboard
+	url = git@github.com:Etqan-agency/chatbot_dashboard.git
