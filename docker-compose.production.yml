@@ -153,3 +153,51 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+
+  # Serves tenant uploads. Django mounts MEDIA_URL only under DEBUG, so in
+  # production /media/ MUST come from here. The router carries a higher
+  # priority than the api catch-all so that PathPrefix wins on the same host.
+  media:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./media/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - media_volume:/srv/media:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.media.rule=Host(`api.${DOMAIN}`) && PathPrefix(`/media`)"
+      - "traefik.http.routers.media.entrypoints=web-secure"
+      - "traefik.http.routers.media.tls=true"
+      - "traefik.http.routers.media.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.media.middlewares=secure-headers@file,rate-limit-static@file"
+      # Higher than the api router's default (which is the rule's length).
+      # Without this, matching is by rule length and the outcome is incidental
+      # rather than intended.
+      - "traefik.http.routers.media.priority=100"
+      - "traefik.http.services.media.loadbalancer.server.port=80"
+
+  dashboard:
+    image: ghcr.io/etqan-agency/chatbot/dashboard:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - web
+      - media
+    deploy:
+      replicas: 2
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.app.rule=Host(`app.${DOMAIN}`)"
+      - "traefik.http.routers.app.entrypoints=web-secure"
+      - "traefik.http.routers.app.tls=true"
+      - "traefik.http.routers.app.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.app.middlewares=secure-headers@file,rate-limit-static@file"
+      - "traefik.http.services.dashboard.loadbalancer.server.port=80"
+      - "traefik.http.services.dashboard.loadbalancer.healthcheck.path=/"
+      - "traefik.http.services.dashboard.loadbalancer.healthcheck.interval=10s"
+      - "traefik.http.services.dashboard.loadbalancer.healthcheck.timeout=3s"
