@@ -1,0 +1,38 @@
+http:
+  middlewares:
+    # Django builds absolute URLs and validates CSRF against the forwarded
+    # scheme. Behind TLS termination it would otherwise see plain http.
+    csrf-headers:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
+        hostsProxyHeaders:
+          - "X-CSRFToken"
+
+    secure-headers:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        frameDeny: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+
+    # The API is called by tenants' own integrations as well as the dashboard,
+    # so this is a coarse abuse guard only. Per-tenant limits are enforced in
+    # the application (knowledge/services/quota.py), which is the layer that
+    # knows who the caller is.
+    rate-limit-api:
+      rateLimit:
+        average: 50
+        burst: 100
+        period: 1s
+
+    # Static asset serving; the limit exists to blunt scrapers, not to shape
+    # normal use.
+    rate-limit-static:
+      rateLimit:
+        average: 100
+        burst: 200
+        period: 1s
