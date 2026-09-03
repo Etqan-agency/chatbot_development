@@ -141,3 +141,15 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # The image's own HEALTHCHECK curls :8000/health/, which only makes sense
+    # for gunicorn. This service runs celery, so nothing listens there and the
+    # inherited probe would report unhealthy forever -- noise that masks real
+    # failures, and a deadlock for anything that later waits on
+    # `condition: service_healthy`. Override it with a probe of the thing that
+    # is actually running.
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A Conf inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
