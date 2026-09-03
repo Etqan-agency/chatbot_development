@@ -1,0 +1,12 @@
+# Local scratch that must never reach the repo
+.env
+*.png
+.playwright-mcp/
+
+# SDD working artefacts
+.superpowers/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
