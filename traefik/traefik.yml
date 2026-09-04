@@ -18,15 +18,45 @@ accessLog:
         X-Forwarded-For: keep
 
 entryPoints:
+  # Plaintext, and published on 127.0.0.1 only (see the ports: block in
+  # docker-compose.production.yml). The host's nginx terminates TLS and proxies
+  # here; nothing outside the host can reach this.
+  #
+  # There is deliberately NO redirection to web-secure. nginx already redirects
+  # http->https at the edge, and a redirect here would bounce nginx's proxied
+  # request straight back to nginx, which re-proxies it: an infinite loop, and
+  # the first thing that breaks if this is reintroduced.
   web:
     address: ":80"
-    http:
-      redirections:
-        entryPoint:
-          to: web-secure
-          scheme: https
-          permanent: true
+    forwardedHeaders:
+      # Traefik overwrites X-Forwarded-* from an untrusted source. Without this,
+      # every request looks like it came from nginx: the access log records the
+      # proxy's address instead of the client's, and the rate-limit middlewares
+      # key every tenant into ONE shared bucket.
+      #
+      # The value is the source address Traefik actually sees for a request
+      # arriving via a published port, which is NOT 127.0.0.1 -- Docker DNATs
+      # it and the container sees the bridge gateway. Measured empirically
+      # from Traefik's own access log against a live request; do not guess it.
+      trustedIPs:
+        - "127.0.0.1/32"
+        # A request through the published port arrives at Traefik as the
+        # bridge gateway address (172.18.0.1), not 127.0.0.1 -- Docker DNATs
+        # it. Pinned as a /32, not the /16 subnet: the gateway is always .1 of
+        # whatever subnet chatbot_default's IPAM assigns, so if the subnet
+        # ever moves this address moves with it -- a /16 would miss the new
+        # gateway exactly as a /32 would, and would additionally trust every
+        # OTHER container in chatbot_default (they can reach traefik:80
+        # directly, bypassing the published port entirely). Since XFF is what
+        # the rate limiter keys on, that would let a compromised web/worker/
+        # dashboard/media container forge X-Forwarded-For and steal or poison
+        # another tenant's bucket. A /32 grants none of that.
+        - "172.18.0.1/32"
 
+  # Dormant. Nothing routes here while nginx terminates TLS, and it is not
+  # published, so it binds only inside the container. Kept so that moving this
+  # stack to a host where Traefik owns 80/443 is a ports change plus four
+  # labels rather than a re-derivation.
   web-secure:
     address: ":443"
 
@@ -44,6 +74,14 @@ api:
   dashboard: false
   insecure: true
 
+# DORMANT while nginx terminates TLS. ACME is on-demand: no router names a
+# certresolver and no `domains` are declared here, so Traefik never contacts
+# Let's Encrypt. It is kept, not deleted, because re-enabling it is the whole
+# difference between this topology and a Traefik-owned 80/443 one.
+#
+# If a router is ever given `tls.certresolver=letsencrypt` while Traefik is
+# behind nginx, the httpChallenge below will fail forever: it answers on the
+# `web` entrypoint, which is not publicly reachable.
 certificatesResolvers:
   letsencrypt:
     acme:

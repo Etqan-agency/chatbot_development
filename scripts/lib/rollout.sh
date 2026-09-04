@@ -81,6 +81,56 @@ traefik_backends_up() {
   | sed -n 's/.*"\(http:\/\/[^"]*\)":"\(UP\|DOWN\)".*/\1 \2/p'
 }
 
+# Assert every port the Traefik container publishes is bound to 127.0.0.1.
+#
+# The whole security model of this topology rests on that one binding: Traefik
+# terminates no TLS and writes no request log of its own, because both are the
+# host nginx's job in front of it (docs/DEPLOY.md §1). Publish it on 0.0.0.0
+# instead and the entire stack is served in cleartext to the internet.
+#
+# Nothing else catches that. ufw cannot -- Docker inserts its own iptables
+# rules ahead of ufw's, so a 0.0.0.0-published container port is reachable
+# whether or not ufw has a matching rule. Nor can the smoke probes: all five
+# request 127.0.0.1:8081, which answers identically either way, so a wrongly
+# published gateway passes every check the deploy makes. Hence an explicit
+# assertion, in the preflight, before anything is mutated.
+assert_loopback_publication() {
+  local out rc line addr bad=0
+  out=$(docker port "$TRAEFIK_CONTAINER" 2>&1); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "ERROR: could not read ${TRAEFIK_CONTAINER}'s published ports:" >&2
+    echo "       ${out}" >&2
+    return 1
+  fi
+  if [ -z "$out" ]; then
+    echo "ERROR: ${TRAEFIK_CONTAINER} publishes no ports at all." >&2
+    echo "       Expected the traefik service's \`ports:\` entry in" >&2
+    echo "       ${COMPOSE_FILE} to read \"127.0.0.1:8081:80\"." >&2
+    return 1
+  fi
+  while read -r line; do
+    [ -n "$line" ] || continue
+    # A `docker port` line is "80/tcp -> 127.0.0.1:8081". Drop the mapping
+    # arrow, then the trailing :port, leaving the bind address.
+    addr="${line##* -> }"
+    addr="${addr%:*}"
+    [ "$addr" = "127.0.0.1" ] && continue
+    echo "ERROR: ${TRAEFIK_CONTAINER} publishes ${line}" >&2
+    echo "       -- bound to ${addr}, not 127.0.0.1." >&2
+    bad=1
+  done <<<"$out"
+  if [ "$bad" -ne 0 ]; then
+    echo "       The gateway is reachable over plain http from off-host," >&2
+    echo "       bypassing nginx's TLS and access log. Fix the traefik" >&2
+    echo "       service's \`ports:\` entry in ${COMPOSE_FILE} back to" >&2
+    echo "         - \"127.0.0.1:8081:80\"" >&2
+    echo "       then re-create the container:" >&2
+    echo "         docker compose -f ${COMPOSE_FILE} up -d --no-deps traefik" >&2
+    return 1
+  fi
+  return 0
+}
+
 # Return 0 once >= expected backends report UP, 1 on timeout.
 wait_backends_up() {
   local service="$1" expected="$2" timeout="$3"

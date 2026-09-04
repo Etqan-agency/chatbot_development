@@ -36,8 +36,13 @@ services:
     image: traefik:v3.6.25
     restart: unless-stopped
     ports:
-      - "80:80"
-      - "443:443"
+      # 127.0.0.1 ONLY. Published on 0.0.0.0 this serves the entire stack over
+      # plain http on 8081, bypassing nginx's TLS and its access log -- and
+      # ufw does not help, because Docker's iptables rules are inserted ahead
+      # of it. (Rate limiting is Traefik's, not nginx's, and stays in force on
+      # this path either way.) deploy.sh's preflight refuses to run if any
+      # published mapping here is not on 127.0.0.1.
+      - "127.0.0.1:8081:80"
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
@@ -115,10 +120,11 @@ services:
       replicas: 2
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.api.rule=Host(`api.${DOMAIN}`)"
-      - "traefik.http.routers.api.entrypoints=web-secure"
-      - "traefik.http.routers.api.tls=true"
-      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+      # Plain http on the `web` entrypoint: the host's nginx terminates TLS and
+      # proxies here over loopback. No tls/certresolver labels -- see the
+      # dormant ACME note in traefik/traefik.yml.
+      - "traefik.http.routers.api.rule=Host(`${API_HOST}`)"
+      - "traefik.http.routers.api.entrypoints=web"
       - "traefik.http.routers.api.middlewares=csrf-headers@file,secure-headers@file,rate-limit-api@file"
       - "traefik.http.services.web.loadbalancer.server.port=8000"
       # The drain-aware probe. Returns 503 while /tmp/drain exists, which is how
@@ -130,7 +136,7 @@ services:
       # hostname it sends that IP as the Host header, Django's ALLOWED_HOSTS
       # rejects it with 400, Traefik concludes every backend is dead, and the
       # whole host 503s. Only `web` needs this -- nginx does not validate Host.
-      - "traefik.http.services.web.loadbalancer.healthcheck.hostname=api.${DOMAIN}"
+      - "traefik.http.services.web.loadbalancer.healthcheck.hostname=${API_HOST}"
       # Without an explicit status, Traefik counts any 2xx OR 3xx as healthy. A
       # redirect (e.g. Django's SSL redirect) must never read as health, or the
       # drain gate Plan 3 depends on silently stops gating anything.
@@ -183,10 +189,8 @@ services:
       start_period: 5s
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.media.rule=Host(`api.${DOMAIN}`) && PathPrefix(`/media`)"
-      - "traefik.http.routers.media.entrypoints=web-secure"
-      - "traefik.http.routers.media.tls=true"
-      - "traefik.http.routers.media.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.media.rule=Host(`${API_HOST}`) && PathPrefix(`/media`)"
+      - "traefik.http.routers.media.entrypoints=web"
       - "traefik.http.routers.media.middlewares=secure-headers@file,rate-limit-static@file"
       # Higher than the api router's default (which is the rule's length).
       # Without this, matching is by rule length and the outcome is incidental
@@ -204,10 +208,8 @@ services:
       replicas: 2
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.app.rule=Host(`app.${DOMAIN}`)"
-      - "traefik.http.routers.app.entrypoints=web-secure"
-      - "traefik.http.routers.app.tls=true"
-      - "traefik.http.routers.app.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.app.rule=Host(`${APP_HOST}`)"
+      - "traefik.http.routers.app.entrypoints=web"
       - "traefik.http.routers.app.middlewares=secure-headers@file,rate-limit-static@file"
       - "traefik.http.services.dashboard.loadbalancer.server.port=80"
       - "traefik.http.services.dashboard.loadbalancer.healthcheck.path=/"

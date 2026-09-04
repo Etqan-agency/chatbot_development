@@ -54,6 +54,12 @@ case "$1" in
       *"127.0.0.1:8080/api/http/services"*) cat "$STUB_DIR/api.json" 2>/dev/null ;;
     esac
     ;;
+  port)
+    # `docker port <container>`: one "80/tcp -> <addr>:<port>" line per
+    # published mapping. $STUB_DIR/port holds whatever the test staged;
+    # reset_stub seeds it with the correct loopback publication.
+    cat "$STUB_DIR/port" 2>/dev/null
+    ;;
   stop)
     [ -e "$STUB_DIR/stop_noop" ] && exit 0
     c="${*: -1}"
@@ -110,6 +116,7 @@ reset_stub() { # reset_stub <api-json> [ps-lines...]
   : > "$STUB_DIR/health"
   echo healthy > "$STUB_DIR/health_default"
   rm -f "$STUB_DIR/stop_noop"
+  printf '80/tcp -> 127.0.0.1:8081\n' > "$STUB_DIR/port"
   : > "$STUB_DIR/up_creates"
   : > "$STUB_DIR/ps"
   [ "$#" -gt 0 ] && printf '%s\n' "$@" > "$STUB_DIR/ps"
@@ -363,7 +370,7 @@ setup_proj() { # a throwaway deploy directory holding a copy of scripts/
   : > "$PROJ/docker-compose.production.yml"
   : > "$PROJ/media/nginx.conf"
   : > "$PROJ/traefik/traefik.yml"
-  printf 'DOMAIN=example.test\n' > "$PROJ/.env"
+  printf 'API_HOST=api.example.test\nAPP_HOST=app.example.test\n' > "$PROJ/.env"
 }
 
 # --- RESIDUAL 1: the preflight must catch a NON-web service, before any
@@ -391,6 +398,66 @@ check "deploy.sh stopped no container" "0" \
   "$(grep -c '^stop ' "$STUB_DIR/calls.log" || true)"
 check "dashboard is untouched at 3 replicas" "3" \
   "$(grep -c '^chatbot-dashboard-' "$STUB_DIR/ps")"
+
+# --- the loopback-publication guard. Traefik published on anything but
+#     127.0.0.1 serves the whole stack in cleartext off-host, and every smoke
+#     probe still passes because they all request 127.0.0.1:8081 -- so the
+#     preflight is the only thing that can catch it. Both directions are
+#     asserted: the correct publication must NOT be refused, or the guard is a
+#     tripwire nobody can deploy past.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+out=$(bash "$PROJ/scripts/deploy.sh" testtag --skip-backup 2>&1); rc=$?
+check "a loopback-published traefik passes the preflight" "0" "$rc"
+check "the preflight says so" "1" \
+  "$(grep -c 'traefik published on loopback only' <<<"$out" || true)"
+
+for bind in "0.0.0.0:8081" "[::]:8081" "10.0.0.5:8081"; do
+  setup_proj
+  reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+    chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+  printf '80/tcp -> %s\n' "$bind" > "$STUB_DIR/port"
+  # Same fixture as the passing case above, so the only difference between a
+  # rc=0 and this rc=1 is the publication -- otherwise a refusal assertion
+  # could be satisfied by an unrelated late failure.
+  echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+  err=$(bash "$PROJ/scripts/deploy.sh" testtag --skip-backup 2>&1 >/dev/null); rc=$?
+  check "deploy.sh refuses a traefik published on ${bind}" "1" "$rc"
+  check "the refusal quotes the offending mapping (${bind})" "1" \
+    "$(grep -cF -- "80/tcp -> ${bind}" <<<"$err" || true)"
+  check "the refusal names the compose ports line (${bind})" "1" \
+    "$(grep -cF -- '- "127.0.0.1:8081:80"' <<<"$err" || true)"
+  check "it refused BEFORE pulling images (${bind})" "0" \
+    "$(grep -c '^compose -f .* pull' "$STUB_DIR/calls.log" || true)"
+  check "it refused BEFORE any mutation (${bind})" "0" \
+    "$(grep -cE '^(stop|rm) |--scale' "$STUB_DIR/calls.log" || true)"
+done
+
+# A mixed publication -- one good mapping, one not -- must still refuse. A
+# check that only looked at the first line would let this through.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+printf '80/tcp -> 127.0.0.1:8081\n8080/tcp -> 0.0.0.0:8080\n' > "$STUB_DIR/port"
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+err=$(bash "$PROJ/scripts/deploy.sh" testtag --skip-backup 2>&1 >/dev/null); rc=$?
+check "deploy.sh refuses when only ONE of two mappings is public" "1" "$rc"
+check "the refusal names the public mapping, not the loopback one" "1" \
+  "$(grep -cF -- '8080/tcp -> 0.0.0.0:8080' <<<"$err" || true)"
+
+# No published ports at all is also a refusal: it means the ports: entry was
+# deleted, and nginx would then proxy to nothing.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+: > "$STUB_DIR/port"
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+err=$(bash "$PROJ/scripts/deploy.sh" testtag --skip-backup 2>&1 >/dev/null); rc=$?
+check "deploy.sh refuses when traefik publishes nothing" "1" "$rc"
+check "the refusal says so" "1" \
+  "$(grep -c 'publishes no ports at all' <<<"$err" || true)"
 
 # --- RESIDUAL 2: rollback.sh must PROCEED from the dirty state a deploy refuses.
 setup_proj
@@ -515,6 +582,26 @@ check "a rollback to CURRENT leaves CURRENT at the target" "CURRENT=goodtag" \
   "$(grep '^CURRENT=' "$PROJ/.release-state" || true)"
 check "a rollback to CURRENT PRESERVES the older PREVIOUS" "PREVIOUS=oldertag" \
   "$(grep '^PREVIOUS=' "$PROJ/.release-state" || true)"
+
+# --- smoke_probes emits both public and loopback probes -------------------
+# smoke_probes lives in services.sh, which rollout.test.sh deliberately does
+# NOT source at top level (see the reconcile_command comment above: sourcing
+# it would give release_current a definition and change that test's result).
+# Sourced inside each command substitution instead, so the function exists
+# only for that subshell and never leaks into the rest of the suite.
+# shellcheck source=SCRIPTDIR/services.sh
+out=$(source ./services.sh && smoke_probes api.example.test app.example.test probe/t.txt)
+check "smoke_probes emits five probes" "5" "$(grep -c . <<<"$out")"
+check "three probes are public https" "3" \
+  "$(grep -c '^https://' <<<"$out" || true)"
+check "two probes go straight at the gateway" "2" \
+  "$(grep -c '^http://127.0.0.1:8081' <<<"$out" || true)"
+check "the loopback probes carry a Host header field" "2" \
+  "$(grep -cE '^http://127\.0\.0\.1:8081[^|]*\|200\|[a-z.]+$' <<<"$out" || true)"
+# Both loopback lines carry the overridden gateway URL, hence 2, not 1.
+# shellcheck source=SCRIPTDIR/services.sh
+check "the gateway URL is overridable" "2" \
+  "$(source ./services.sh && smoke_probes a.test b.test t.txt http://127.0.0.1:9999 | grep -c '9999' || true)"
 
 # ---------------------------------------------------------------------------
 # service_labels_match: the guard for Traefik's "one service, one definition"

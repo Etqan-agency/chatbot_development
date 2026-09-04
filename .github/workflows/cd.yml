@@ -139,7 +139,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: production
-      url: https://app.${{ vars.DOMAIN }}
+      url: https://${{ vars.APP_HOST }}
     concurrency:
       group: deploy-production
       cancel-in-progress: false
@@ -216,7 +216,8 @@ jobs:
         if: success()
         env:
           TAG: ${{ needs.verify-images.outputs.image_tag }}
-          DOMAIN: ${{ vars.DOMAIN }}
+          API_HOST: ${{ vars.API_HOST }}
+          APP_HOST: ${{ vars.APP_HOST }}
           # Routed through env: like every other interpolation in this file,
           # rather than spliced into the run: block. github.actor is not
           # attacker-controlled here, but "no ${{ }} inside a run: body" is a
@@ -228,8 +229,8 @@ jobs:
             echo ""
             echo "| Service | URL |"
             echo "|---------|-----|"
-            echo "| Dashboard | https://app.${DOMAIN} |"
-            echo "| API | https://api.${DOMAIN} |"
+            echo "| Dashboard | https://${APP_HOST} |"
+            echo "| API | https://${API_HOST} |"
             echo ""
             echo "**Image Tag:** \`${TAG}\`"
             echo "**Triggered by:** ${ACTOR}"

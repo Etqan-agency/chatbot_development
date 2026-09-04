@@ -5,19 +5,42 @@ decision below has been forgotten. It assumes no prior context: it names every
 file, secret and command it depends on.
 
 The stack is one Docker Compose project (`docker-compose.production.yml`,
-pinned `name: chatbot`) fronted by Traefik on a single Ubuntu host. Deploys and
-rollbacks are driven from GitHub Actions, but the scripts they call
+pinned `name: chatbot`), fronted by Traefik, fronted in turn by nginx on the
+same Ubuntu host (see §1 for the full request path). Deploys and rollbacks are
+driven from GitHub Actions, but the scripts they call
 (`scripts/deploy.sh`, `scripts/rollback.sh`, `scripts/sync-service-labels.sh`)
 are ordinary bash and can be run by hand on the server if Actions is
 unavailable.
 
 ## 1. Topology
 
+The request path has a hop in front of the Docker stack:
+
+```text
+client → nginx (host, :443, certbot TLS) → 127.0.0.1:8081 → Traefik → containers
+```
+
+nginx runs directly on the host (not in Compose), owns `:80`/`:443`, and
+terminates TLS with certbot-issued certificates. It reverse-proxies everything
+to Traefik over loopback. Traefik **terminates nothing and requests no
+certificates of its own** — its one active entrypoint (`web`, plaintext
+`:80`) is published as `127.0.0.1:8081` only, so nothing outside the host can
+reach it directly. Its ACME configuration (`web-secure`, `certificatesResolvers`
+in `traefik/traefik.yml`) is kept in the file but dormant: no router names a
+`certresolver`, so Traefik never contacts Let's Encrypt. See §2 for why it's
+kept rather than deleted.
+
+This only changes what sits in front of Traefik. The load-balancer
+healthchecks that gate a rolling deploy (`web`'s drain-aware `/health/` probe,
+`dashboard`'s `/` probe) and the drain gate described in §4/§6 run
+Traefik→container, entirely behind nginx, and are unaffected by anything
+in front of Traefik.
+
 Ten containers, five services never rolled and three rolled:
 
 | Service | Replicas | Rolled? | Role |
 |---|---|---|---|
-| `traefik` | 1 | no | Gateway: TLS termination, routing, ACME |
+| `traefik` | 1 | no | Gateway: plaintext routing only. Reachable over loopback (`127.0.0.1:8081`); TLS terminates at nginx (host), not here |
 | `socket-proxy` | 1 | no | Read-only Docker socket proxy for Traefik's docker provider |
 | `db` | 1 | no | PostgreSQL (`pgvector/pgvector:pg16`) |
 | `redis` | 1 | no | Cache + Celery broker |
@@ -34,15 +57,18 @@ gunicorn/nginx stop timeout would kill it mid-task). `media`, `db`, `redis`,
 serving a read-only mount with no in-flight state, and the rest are
 infrastructure that isn't safe or meaningful to roll this way.
 
-Two hostnames, both derived from one `DOMAIN` value:
+Two hostnames, **independent** — `API_HOST` and `APP_HOST`, `.env` values on
+the server; nothing derives one from the other:
 
-- **`api.${DOMAIN}`** serves the Django API on the `api` router, and `/media/`
-  on a separate `media` router with **priority 100** (higher than `api`'s
-  default rule-length priority), so a request for `/media/...` on that host
-  goes to the `media` service, not to `web`.
-- **`app.${DOMAIN}`** serves the React SPA (`dashboard`). The dashboard's own
-  nginx proxies `/api/` **same-origin**, straight to `web:8000` over Docker
-  DNS — this request never goes through Traefik. See §8 for why that matters.
+- **`API_HOST`** (`api-demo-chatbot.abdulkhalek.dev`) serves the Django API on
+  the `api` router, and `/media/` on a separate `media` router with
+  **priority 100** (higher than `api`'s default rule-length priority), so a
+  request for `/media/...` on that host goes to the `media` service, not to
+  `web`.
+- **`APP_HOST`** (`app-demo-chatbot.abdulkhalek.dev`) serves the React SPA
+  (`dashboard`). The dashboard's own nginx proxies `/api/` **same-origin**,
+  straight to `web:8000` over Docker DNS — this request never goes through
+  Traefik. See §8 for why that matters.
 
 ## 2. Provisioning a host
 
@@ -70,6 +96,25 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
    sudo ufw allow 443
    sudo ufw enable
    ```
+   80 and 443 are for **nginx** — it is what listens on `0.0.0.0`. Traefik
+   needs no firewall rule of its own: it is published as `127.0.0.1:8081`
+   (see §1), which is not reachable from outside the host regardless of what
+   ufw allows.
+
+   **Loopback binding is the control here, not the firewall.** Docker inserts
+   its own iptables `DOCKER-USER`/`DOCKER` chain rules ahead of ufw's, so a
+   container port published on `0.0.0.0` is reachable from the network
+   whether or not ufw has a matching `allow` rule — ufw simply never gets a
+   say for Docker-published ports. If Traefik's port publication in
+   `docker-compose.production.yml` were ever changed from
+   `127.0.0.1:8081:80` to `8081:80` (or `0.0.0.0:8081:80`), the whole stack
+   would become reachable over plain HTTP on 8081, bypassing nginx's TLS and
+   its access log, and ufw would not stop it. (Rate limiting is *not* among
+   the losses: it is Traefik's, in `traefik/dynamic/middlewares.yml`, and is
+   applied on the 8081 path itself.) `deploy.sh`'s preflight asserts every
+   published Traefik mapping is on `127.0.0.1` and refuses otherwise, so a
+   deploy cannot proceed against a wrongly-published gateway — but a manual
+   `docker compose up -d` still can, which is why §11 also checks it.
 
 4. **Create the `deploy` user and add it to the `docker` group:**
    ```bash
@@ -94,16 +139,78 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
    `media/` into it (CD's "Sync deployment files" step does this on every
    run). Either way, **write `.env` on the server by hand from
    `.env.example`.** `.env` never enters Git — CD does not sync it, and
-   `deploy.sh` reads it as the authoritative source for `DOMAIN` and
-   everything else.
+   `deploy.sh` reads it as the authoritative source for `API_HOST`, `APP_HOST`
+   and everything else.
 
-7. **DNS A records for both `api.${DOMAIN}` and `app.${DOMAIN}`, pointing at
-   this host, before the first deploy.** Traefik's certificate resolver uses
-   Let's Encrypt HTTP-01, which resolves the hostname over the public internet
-   to validate ownership. Without both records in place, ACME fails silently
-   and Traefik falls back to serving its self-signed default certificate to
-   every visitor — the site looks "up" with a browser warning, which is a
-   worse failure mode than not resolving at all.
+7. **Install nginx, then the two vhosts, then certbot — before the first
+   deploy, and independent of it.** With the gateway split (§1), certificates
+   are decoupled from deploys entirely: nothing in `deploy.sh` talks to Let's
+   Encrypt, so this step has no deadline relative to CD, only relative to DNS.
+
+   - **DNS A and AAAA records for both `api-demo-chatbot.abdulkhalek.dev` and
+     `app-demo-chatbot.abdulkhalek.dev`, pointing at this host, must exist
+     before certbot runs** (not before the first deploy — see above). certbot
+     uses the same HTTP-01 challenge Traefik's dormant resolver would have
+     used: it resolves the hostname over the public internet to validate
+     ownership, so a missing record fails the request for that host outright.
+   - Install nginx (`sudo apt install nginx`), then copy the two reference
+     vhosts from `docs/nginx/` into `/etc/nginx/sites-available/` and enable
+     them:
+     ```bash
+     sudo cp docs/nginx/api-demo-chatbot.conf \
+       /etc/nginx/sites-available/api-demo-chatbot.abdulkhalek.dev
+     sudo cp docs/nginx/app-demo-chatbot.conf \
+       /etc/nginx/sites-available/app-demo-chatbot.abdulkhalek.dev
+     sudo ln -s /etc/nginx/sites-available/api-demo-chatbot.abdulkhalek.dev \
+       /etc/nginx/sites-enabled/
+     sudo ln -s /etc/nginx/sites-available/app-demo-chatbot.abdulkhalek.dev \
+       /etc/nginx/sites-enabled/
+     sudo nginx -t && sudo systemctl reload nginx
+     ```
+     **The files under `/etc/nginx/sites-available/` are the live vhosts.
+     `docs/nginx/*.conf` are reference copies only — CD cannot deploy them**
+     (they live outside `DEPLOY_PATH` and are root-owned, unlike everything
+     else CD syncs). **The two are kept in sync by hand.** If either vhost is
+     changed — a header, a timeout, a body-size limit — copy the change into
+     both places yourself; nothing else does it for you.
+
+     **The shipped vhosts contain a `:80` server block only** — no `listen
+     443`, no `ssl_certificate`. That is deliberate and must stay that way
+     until certbot has run. A `listen 443 ssl` block whose certificate lines
+     are commented out is not a valid configuration: nginx fails the whole
+     config with `no "ssl_certificate" is defined for the "listen ... ssl"
+     directive`. With the symlinks already live, that failure means nginx
+     **refuses to start at all** on the next `systemctl restart` (a reboot, an
+     apt upgrade), taking `:80` and `:443` down for *every* site on this host.
+     certbot cannot rescue it either — it runs `nginx -t` itself first.
+   - Obtain the certificates:
+     ```bash
+     sudo certbot --nginx \
+       -d api-demo-chatbot.abdulkhalek.dev \
+       -d app-demo-chatbot.abdulkhalek.dev
+     ```
+     certbot **creates** the `:443 ssl` server block in each vhost, fills in
+     the `ssl_certificate`/`ssl_certificate_key` lines, and rewrites the `:80`
+     `location /` to redirect. Renewal is certbot's own systemd timer
+     (`certbot.timer`) — there is no Traefik involvement in issuance or
+     renewal.
+
+     The `:80` block keeps its `location /.well-known/acme-challenge/` for
+     renewals. Note that the redirect is written as `location / { return 301
+     ... }` rather than a server-level `return 301`: a server-level return runs
+     in nginx's rewrite phase, *before* location matching, and would swallow
+     the challenge — every renewal would then fail.
+   - **Add the proxy settings to the `:443` block certbot just created.** Each
+     vhost carries them as a commented `REFERENCE` block at the bottom of the
+     file; copy that block's contents into the generated `server { listen 443
+     ssl; ... }` and uncomment. This is `client_max_body_size 25M`, the two
+     `120s` proxy timeouts and the whole `location /` `proxy_pass` to
+     `127.0.0.1:8081`. certbot generates none of them, and without them the
+     vhost terminates TLS and then serves nothing. Then:
+
+     ```bash
+     sudo nginx -t && sudo systemctl reload nginx
+     ```
 
 8. **Bring the stack up once by hand, before any CD run:**
    ```bash
@@ -125,7 +232,17 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
 | `DEPLOY_USER` | secret | Login fails, or succeeds as the wrong user without `docker` group membership, so every `docker compose` call fails on the socket |
 | `DEPLOY_PATH` | secret | Files sync into the wrong directory, or `cd "${DEPLOY_PATH}"` fails and every remote command after it runs from the wrong `cwd` (or the login shell's home, silently) |
 | `GHCR_PAT` | secret | The server-side `docker login ghcr.io` fails, so `docker compose pull` can't fetch the images and the deploy stops at "pulling images" |
-| `DOMAIN` | **repository variable**, not a secret | `cd.yml` reads it as `vars.DOMAIN` for the GitHub environment's `url:` field and the deployment summary table. **This is cosmetic only** — `deploy.sh` never reads it from the workflow. The authoritative `DOMAIN` is whatever is written in the server's `.env`, read via `envval DOMAIN`. If the two disagree, the summary link points at the wrong host but the deploy itself still targets the right one (or vice versa if `.env` is stale) — check `.env` on the server, not the repo variable, when in doubt. |
+| `API_HOST` | **repository variable**, not a secret | `cd.yml` reads it as `vars.API_HOST` for the deployment summary table only. **This is cosmetic only** — `deploy.sh` never reads it from the workflow. |
+| `APP_HOST` | **repository variable**, not a secret | `cd.yml` reads it as `vars.APP_HOST`, for both the GitHub environment's `url:` field and the deployment summary table. **This is cosmetic only** — `deploy.sh` never reads it from the workflow. |
+
+`API_HOST` and `APP_HOST` are **independent** repository variables — neither
+is derived from the other, and there is no `DOMAIN` variable to derive them
+from. In both cases the authoritative value is whatever is written in the
+server's `.env`, read via `envval API_HOST` / `envval APP_HOST`. If a
+repository variable and the server's `.env` disagree, the environment link or
+summary table points at the wrong host but the deploy itself still targets
+whatever `.env` says (or vice versa if `.env` is stale) — check `.env` on the
+server, not the repository variables, when in doubt.
 
 ## 4. A normal deploy
 
@@ -163,6 +280,38 @@ smoke-check failure (the very last step) triggers the automatic call to
 `rollback.sh`, and even then it rolls back to `CURRENT` from
 `.release-state` — see §5 for why that matters. Read the failed run's log to
 see which stage it stopped at before assuming anything was rolled back.
+
+### The five smoke probes
+
+`smoke_probes` (`scripts/lib/services.sh`) emits five checks, not three — the
+last two exist specifically to tell a broken release apart from a broken
+gateway:
+
+1. `https://<API_HOST>/health/` — public, through nginx and Traefik.
+2. `https://<APP_HOST>/` — public, through nginx and Traefik.
+3. `https://<API_HOST>/media/<probe path>` — public, through nginx, Traefik
+   and the `media` service; the only probe that exercises the priority router
+   and the shared volume mount.
+4. `http://127.0.0.1:8081/health/` with an explicit `Host: <API_HOST>` header
+   — straight at Traefik's loopback port, bypassing nginx entirely.
+5. `http://127.0.0.1:8081/` with an explicit `Host: <APP_HOST>` header — same,
+   for the dashboard.
+
+Probes 4 and 5 have to carry the `Host` header themselves because they are
+not going through nginx, which is what would normally supply it from the
+public hostname — Traefik's routers match on `Host(...)`, so a request
+without one falls through to no router at all.
+
+Read the two probe layers together:
+
+| Public | Loopback | Means |
+|---|---|---|
+| fail | pass | The application is healthy. The fault is nginx, certbot or DNS. `deploy.sh` will still have rolled back — re-deploy after fixing the gateway. |
+| fail | fail | The release is bad. The auto-rollback was correct. |
+| pass | fail | Should be impossible; nginx is proxying somewhere other than `127.0.0.1:8081`. |
+
+(pass/pass is the fifth, unlisted combination: everything is healthy, nothing
+to do.)
 
 ## 5. Rolling back
 
@@ -380,12 +529,14 @@ radius; none is scheduled to be fixed as of this writing.
 
 **What "zero-downtime" has actually been measured to mean here.** A local
 rehearsal of a full rolling deploy served **400/400 requests with none
-dropped**. That measurement was taken against `api.${DOMAIN}` — i.e. **through
-Traefik**, which is the path with health-aware routing and the drain-aware
-`/health/` route. The `app.${DOMAIN}/api/` path, where the dashboard's nginx
-proxies to `web:8000` over Docker DNS and bypasses Traefik entirely, was
-**not** measured. That is the path carrying the 10-second resolver residual
-described below, so the 400/400 result should not be read as covering it.
+dropped**. That measurement was taken directly against Traefik (this rehearsal
+predates the nginx front-end in §1, and nginx adds a proxy hop, not a change
+to Traefik's own health-aware routing or its drain-aware `/health/` route, so
+the result still describes that path). The dashboard's `/api/` path, where the
+dashboard's own nginx proxies to `web:8000` over Docker DNS and bypasses
+Traefik entirely, was **not** measured. That is the path carrying the
+10-second resolver residual described below, so the 400/400 result should not
+be read as covering it.
 
 - **`dashboard` is not drainable.** `web` has a drain-aware `/health/` route
   (returns 503 while a marker file exists, so Traefik pulls it from rotation
@@ -418,20 +569,64 @@ described below, so the 400/400 result should not be read as covering it.
   order is web-before-dashboard because dashboard is downstream of web; it is
   not what produces the bound.
 
-  This residual is on the `app.${DOMAIN}/api/` path only, and it is the path
+  This residual is on the dashboard's own `/api/` path only, and it is the path
   the 400/400 rehearsal did **not** measure (see above). The complete fix —
   routing dashboard→API traffic through Traefik instead of directly to `web`
   over Docker DNS — is not done and is not currently scheduled.
 
-- **`SECURE_SSL_REDIRECT` must stay `False`** in the server's `.env`. Traefik
-  terminates TLS at the edge and talks to `web` over plain HTTP, including for
-  its own health probes. If `SECURE_SSL_REDIRECT` were `True`, Django would
-  answer every plain-HTTP request — including Traefik's own probe of
-  `/health/` — with a 301 redirect to HTTPS. Traefik's
+- **`SECURE_SSL_REDIRECT` must stay `False`** in the server's `.env`. nginx
+  terminates TLS at the edge (§1); Traefik and `web` only ever see plain HTTP,
+  including for Traefik's own health probes. If `SECURE_SSL_REDIRECT` were
+  `True`, Django would answer every plain-HTTP request — including Traefik's
+  own probe of `/health/` — with a 301 redirect to HTTPS. Traefik's
   `healthcheck.status=200` label reads anything other than exactly 200 as
   unhealthy, so every `web` backend would drop out of rotation and the API
   would 503 across the board. This is off deliberately: the HTTPS redirect is
-  Traefik's job (`entrypoints.web-secure`), not Django's, on this topology.
+  nginx's job (its `:80` server block, per `docs/nginx/*.conf`), not
+  Django's or Traefik's, on this topology.
+
+- **A second proxy hop.** nginx's `client_max_body_size` and
+  `proxy_read_timeout` (`docs/nginx/*.conf`, both `25M`/`120s`) must stay at
+  or above the dashboard's own internal nginx (also `25M`/`120s`) or a request
+  that the dashboard's nginx would have allowed fails one hop earlier, at the
+  host vhost, before it ever reaches Traefik or `web`. **There is no automated
+  check that the two agree** — a deliberate gap, because the host vhost is
+  not deployed by CD (§2): nothing in CI or `deploy.sh` reads
+  `docs/nginx/*.conf`, let alone the live files under
+  `/etc/nginx/sites-available/`, so there is nothing for an automated check to
+  compare against without also changing how the vhosts are deployed.
+
+- **HSTS is set in exactly one place, and only because of one setting**:
+  Traefik's `secure-headers` middleware (`traefik/dynamic/middlewares.yml`).
+  The host nginx vhosts deliberately omit `Strict-Transport-Security`, so if a
+  future nginx change adds it there too, clients receive the header twice —
+  harmless in most clients but worth knowing before debugging a doubled header
+  in a response inspector.
+
+  The load-bearing setting is **`forceSTSHeader: true`**. Traefik emits
+  `Strict-Transport-Security` only for a request it considers TLS; with TLS
+  terminating at the host nginx, every request Traefik sees arrives plain
+  http on the loopback `web` entrypoint, and the `stsSeconds` /
+  `stsIncludeSubdomains` / `stsPreload` settings beside it are inert without
+  it — no route gets HSTS at all, silently. `X-Forwarded-Proto: https` does
+  not change this. Django is not a fallback either: `SECURE_HSTS_SECONDS`
+  defaults to `0`. Verify with:
+
+  ```bash
+  curl -sI -H 'Host: <APP_HOST>' http://127.0.0.1:8081/ | grep -i strict
+  ```
+
+  If that returns nothing, HSTS is off everywhere.
+
+- **The dashboard's `/api/` calls are rate-limited as static, not as API.**
+  Browser traffic to `https://<APP_HOST>/api/...` arrives on the `app`
+  router, so it gets `rate-limit-static` (100/s, burst 200) and never
+  `rate-limit-api` (50/s, burst 100) — the latter applies only to requests
+  addressed to `<API_HOST>`, i.e. tenants' own integrations. This predates the
+  gateway split and is not a regression, but it means the API's coarse abuse
+  guard does not cover the path most real user traffic takes. Per-tenant
+  limits in `knowledge/services/quota.py` are what actually bound that
+  traffic.
 
 ## 9. Cutover from the old VPS
 
@@ -469,7 +664,7 @@ production.
    while the old stack still serves production traffic. This is exactly the
    deploy in §4, run for the first time against real data.
 
-5. **Flip DNS** — repoint the `api.${DOMAIN}` and `app.${DOMAIN}` A records
+5. **Flip DNS** — repoint the `API_HOST` and `APP_HOST` A records
    from the old host to the new one. **Keep the old stack running through the
    full TTL window** (however long the previous records' TTL was, plus
    margin for resolver caching in the wild): it is the rollback path if the
@@ -488,7 +683,7 @@ catch any of them, they don't.
 
 - **Paddle webhook URL** is registered in Paddle's dashboard against the old
   host. Until it's repointed at
-  `https://api.${DOMAIN}/api/v1/billing/paddle/webhook/`, Paddle keeps sending
+  `https://api-demo-chatbot.abdulkhalek.dev/api/v1/billing/paddle/webhook/`, Paddle keeps sending
   webhook events to a host that no longer answers for them and **payments
   stop being fulfilled** with no visible error on the buyer's side. Verify
   with a sandbox event **before** the flip, not after.
@@ -515,22 +710,65 @@ catch any of them, they don't.
 
 Tick these off once, before the very first real deploy against this host:
 
-1. **DNS resolves both hostnames** — `dig +short api.${DOMAIN}` and
-   `dig +short app.${DOMAIN}` both return this host's IP.
-2. **The certificate is real, not self-signed:**
+1. **DNS resolves both hostnames:**
    ```bash
-   curl -sI https://api.${DOMAIN}/health/
+   dig +short api-demo-chatbot.abdulkhalek.dev
+   dig +short app-demo-chatbot.abdulkhalek.dev
    ```
-   succeeds with no certificate warning. If `curl` complains about the
-   certificate, ACME has not completed — recheck DNS (step 1) before
-   retrying; Traefik will keep retrying ACME on its own once DNS is correct.
-3. **Traefik has registered both `web` backends as UP:**
+   both return this host's IP.
+2. **certbot lists both certificates with a future expiry:**
+   ```bash
+   sudo certbot certificates
+   ```
+   shows both `api-demo-chatbot.abdulkhalek.dev` and
+   `app-demo-chatbot.abdulkhalek.dev`, each with an `Expiry Date` in the
+   future. If either is missing, certbot has not been run for that host yet
+   (§2, step 7) — recheck DNS before retrying.
+3. **The certificate nginx actually serves is real, not self-signed or
+   expired:**
+   ```bash
+   curl -sI https://api-demo-chatbot.abdulkhalek.dev/health/
+   ```
+   returns `HTTP/2 200` (or `HTTP/1.1 200`) with no certificate warning. A
+   `curl` certificate complaint here means nginx is not yet serving the
+   certbot certificate for this vhost, even if step 2 lists it — check that
+   `/etc/nginx/sites-enabled/` has the symlink and that `nginx -t` is clean.
+4. **Traefik's loopback port is not reachable from outside the host:**
+   ```bash
+   ss -ltnp | grep 8081
+   ```
+   shows the listener bound to `127.0.0.1:8081`, not `0.0.0.0:8081` or
+   `:::8081`. This is the check for the failure mode described in §2, step 3
+   — a `0.0.0.0` binding here bypasses nginx entirely and ufw will not stop
+   it.
+
+   Every subsequent deploy re-checks this on its own:
+   `deploy.sh`'s preflight runs `docker port chatbot-traefik-1` and refuses,
+   before any mutation, unless every published mapping is on `127.0.0.1`. So
+   this step is a first-deploy confirmation rather than the only guard — but
+   it is still worth running by hand after any change made outside a deploy
+   (a hand-run `docker compose up -d`, an edit to the compose file applied
+   directly), because nothing checks that path.
+5. **Traefik has registered both `web` backends as UP:**
    ```bash
    docker exec chatbot-traefik-1 wget -qO- http://127.0.0.1:8080/api/http/services/web@docker
    ```
-   shows two backend entries, both `"UP"`.
-4. **`.env` is present on the server and `DEBUG=False`** in it.
-5. **Trigger CD once with `dry_run: true`** (Actions → CD → Run workflow →
+   shows two backend entries, both `"UP"` (the `serverStatus` map in the
+   response). **If the response has `loadBalancer.servers` entries but no
+   `serverStatus` field at all**, this is not a fault by itself: `serverStatus`
+   is populated only after Traefik's load-balancer healthcheck has completed
+   at least one cycle (5s interval, per the `healthcheck.interval=5s` label in
+   `docker-compose.production.yml`), so a response taken in the first few
+   seconds after Traefik itself is (re)started or recreated will genuinely
+   have no `serverStatus` yet even though the backends are registered. Wait
+   ~10s and re-run; only treat a missing or non-`"UP"` `serverStatus` as a
+   real fault if it is still that way after the wait.
+6. **`.env` is present on the server, has both `API_HOST` and `APP_HOST` in
+   `ALLOWED_HOSTS`, and `DEBUG=False`.** Miss either host in `ALLOWED_HOSTS`
+   and Django 400s every request for it — including Traefik's own healthcheck
+   probe (see §1, and the compose file's `healthcheck.hostname` label), which
+   takes the whole `web` service out of rotation, not just that one host.
+7. **Trigger CD once with `dry_run: true`** (Actions → CD → Run workflow →
    `dry_run: true`) before the first real deploy. This pulls both images and
    stops — it proves image access and the SSH/sync path work without touching
    any running container.

@@ -32,8 +32,13 @@ STATE_FILE=.release-state
 # The smoke checks need the deployed hostnames, which live in the server's .env
 # (hand-written at provisioning, never in Git). envval and smoke_probes come
 # from services.sh, so a rollback reads the same values through the same code.
-DOMAIN="$(envval DOMAIN)"
-[ -n "$DOMAIN" ] || { echo "DOMAIN is not set in .env" >&2; exit 1; }
+#
+# Two independent keys, not a base domain: this host's names share a parent by
+# coincidence, and `abdulkhalek.dev` belongs to several other servers.
+API_HOST="$(envval API_HOST)"
+APP_HOST="$(envval APP_HOST)"
+[ -n "$API_HOST" ] || { echo "API_HOST is not set in .env" >&2; exit 1; }
+[ -n "$APP_HOST" ] || { echo "APP_HOST is not set in .env" >&2; exit 1; }
 MEDIA_PROBE_PATH="$(envval MEDIA_PROBE_PATH)"
 MEDIA_PROBE_PATH="${MEDIA_PROBE_PATH:-probe/health.txt}"
 # Set during a local rehearsal to e.g. "-k --resolve api.chatbot.local:443:127.0.0.1".
@@ -52,6 +57,8 @@ echo ">>> preflight"
 avail_mb=$(free -m | awk '/Mem:/ {print $7}')
 [ "$avail_mb" -ge 1200 ] || { echo "only ${avail_mb}MiB available; refusing" >&2; exit 1; }
 echo "available memory: ${avail_mb}MiB"
+assert_loopback_publication || exit 1
+echo "traefik published on loopback only"
 
 # The rolling swap health-gates on Traefik's API. That API is enabled by a
 # traefik.yml change that does NOT hot-reload -- it needs a manual container
@@ -166,15 +173,20 @@ smoke_failed=false
 # Process substitution, not a pipe: a pipe would run the loop in a subshell and
 # smoke_failed would never escape it, so every failed deploy would look clean.
 while IFS= read -r probe; do
-  url=${probe%%|*}; want=${probe##*|}
-  # shellcheck disable=SC2086  # SMOKE_CURL_EXTRA is a deliberate argument list
+  url=${probe%%|*}; rest=${probe#*|}
+  want=${rest%%|*}
+  # Third field is the Host header, present only on the loopback probes. When
+  # the probe has only two fields, `rest` has no second `|` and `${rest#*|}`
+  # returns `rest` unchanged -- hence the equality test rather than a -z test.
+  host=${rest#*|}; [ "$host" = "$want" ] && host=""
+  host_arg=(); [ -n "$host" ] && host_arg=(-H "Host: ${host}")
   # `|| true`, not `|| echo 000`: curl already prints 000 on a connection
   # failure AND exits non-zero, so `|| echo 000` yields the string "000000".
-  # It still fails the comparison, but it reads as a bug in the probe.
-  got=$(curl -s -o /dev/null -m 15 -w '%{http_code}' $SMOKE_CURL_EXTRA "$url" || true)
-  echo "  ${url} -> ${got} (want ${want})"
+  # shellcheck disable=SC2086  # SMOKE_CURL_EXTRA is a deliberate argument list
+  got=$(curl -s -o /dev/null -m 15 -w '%{http_code}' $SMOKE_CURL_EXTRA "${host_arg[@]}" "$url" || true)
+  printf '  %-58s -> %s (want %s)\n' "${url}${host:+  [Host: $host]}" "$got" "$want"
   [ "$got" = "$want" ] || smoke_failed=true
-done < <(smoke_probes "$DOMAIN" "$MEDIA_PROBE_PATH")
+done < <(smoke_probes "$API_HOST" "$APP_HOST" "$MEDIA_PROBE_PATH")
 
 if [ "$smoke_failed" = true ]; then
   # Roll back to CURRENT, not PREVIOUS.

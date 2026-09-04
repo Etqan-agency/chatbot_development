@@ -80,15 +80,32 @@ release_current() {
 # The probes that gate a deploy and verify a rollback, as "<url>|<want>".
 # ONE definition, so a rollback can never verify less than the deploy gated on.
 #
+# Two independent hostnames, not a base domain with derived prefixes. They share
+# a parent today, but nothing here may depend on that: `abdulkhalek.dev` is used
+# by several unrelated servers, and this host owns exactly these two names.
+#
 # The media probe is not optional: it is the only check that exercises the
 # priority router and the shared volume mount, and /media/ is the one route that
 # silently regressed when the all-in-one nginx was replaced.
 smoke_probes() {
-  local domain="$1" media_path="$2"
+  local api_host="$1" app_host="$2" media_path="$3"
+  local gateway="${4:-http://127.0.0.1:8081}"
   printf '%s\n' \
-    "https://api.${domain}/health/|200" \
-    "https://app.${domain}/|200" \
-    "https://api.${domain}/media/${media_path}|200"
+    "https://${api_host}/health/|200" \
+    "https://${app_host}/|200" \
+    "https://${api_host}/media/${media_path}|200"
+  # The same two routes again, but straight at Traefik's loopback port with an
+  # explicit Host header, bypassing nginx entirely.
+  #
+  # Without these, an nginx misconfiguration and a broken release are the same
+  # observation: the public probes fail, deploy.sh auto-rolls-back, and a
+  # perfectly good image is reverted for a fault one layer above it. With them,
+  # public-fails + loopback-passes says "the application is fine, fix the
+  # gateway" -- which is not a conclusion the operator should have to derive
+  # under pressure.
+  printf '%s\n' \
+    "${gateway}/health/|200|${api_host}" \
+    "${gateway}/|200|${app_host}"
 }
 
 # `media` is deliberately absent. It is a single replica serving a read-only
