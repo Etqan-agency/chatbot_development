@@ -7,10 +7,17 @@ components are git submodules that keep their own history and their own `main`.
 chatbot/
 ├── chatbot_api/          → submodule: Etqan-agency/chatbot_api (Django 5.2 + DRF)
 ├── chatbot_dashboard/    → submodule: Etqan-agency/chatbot_dashboard (Vite + React 19)
-├── traefik/              → gateway config            (not yet implemented)
-├── scripts/              → deploy.sh, rollback.sh    (not yet implemented)
-├── docker-compose.production.yml                     (not yet implemented)
-└── .github/workflows/    → ci.yml, cd.yml, rollback.yml (not yet implemented)
+├── traefik/              → Traefik v3 static config (traefik.yml) and dynamic
+│                           middlewares (traefik/dynamic/middlewares.yml) --
+│                           pending merge via the open gateway/compose PR
+├── scripts/              → deploy.sh, rollback.sh    (not yet implemented -- Plan 3)
+├── docker-compose.production.yml → gateway, data tier, API, worker, media and
+│                           dashboard services -- pending merge via the open
+│                           gateway/compose PR
+└── .github/workflows/    → ci.yml (lint, test against Postgres, publish both
+                            images to GHCR) and sync-to-meta.yml (lives in each
+                            component repo, not here -- see below); cd.yml and
+                            rollback.yml are not yet implemented (Plan 3)
 ```
 
 ## Clone
@@ -42,9 +49,10 @@ The design and plan documents live in the API submodule:
 
 ## Next: sub-project 1, remaining phases
 
-This repo's own contents — Traefik gateway, production compose, `deploy.sh` /
-`rollback.sh`, and the `ci.yml` → `cd.yml` → `rollback.yml` pipeline — are the next
-phase of work. Two constraints already established that the compose file must honour:
+The Traefik gateway, production compose file, and `ci.yml` have been written on the
+`infra/gateway-compose-ci` branch and are on an open PR into `main`; CI itself is
+green there and publishes both images to GHCR. Two constraints already established
+that the compose file must honour:
 
 1. **A `media` service is mandatory.** The dashboard's nginx resolves `media:80` at
    parse time and will not start without it. Django serves `/media/` only under
@@ -54,7 +62,14 @@ phase of work. Two constraints already established that the compose file must ho
    dashboard's nginx forwards `Host: app.<domain>`, and a bare apex does not cover
    subdomains — otherwise Django answers 400 to every proxied API request.
 
-Merging the release PR into `main` here is intended to be the deploy decision: each
-component's `sync-to-meta` workflow accumulates its submodule pointer bump on a
-`release/next` branch and collects them into a single PR, so a commit on `main`
-always carries a coherent set of pointers.
+Each component now has its own `sync-to-meta.yml` workflow (in `chatbot_api` and
+`chatbot_dashboard`, not in this repo): pushing to a component's `main` bumps that
+component's submodule pointer here on a shared `release/next` branch and opens or
+updates a single "Release: submodule pointer updates" PR. Merging that PR into
+`main` is intended to be the deploy decision, since a commit on `main` always
+carries a coherent set of pointers — this is what stops a new API deploying
+against an old dashboard, or vice versa.
+
+Still outstanding for sub-project 1 (Plan 3): `scripts/deploy.sh`,
+`scripts/rollback.sh`, `cd.yml`, `rollback.yml`, VPS provisioning verification,
+and the DNS cutover.
