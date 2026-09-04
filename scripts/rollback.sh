@@ -65,7 +65,10 @@ echo ">>> verifying"
 while IFS= read -r probe; do
   url=${probe%%|*}; want=${probe##*|}
   # shellcheck disable=SC2086  # SMOKE_CURL_EXTRA is a deliberate argument list
-  got=$(curl -s -o /dev/null -m 15 -w '%{http_code}' $SMOKE_CURL_EXTRA "$url" || echo 000)
+  # `|| true`, not `|| echo 000`: curl already prints 000 on a connection
+  # failure AND exits non-zero, so `|| echo 000` yields the string "000000".
+  # It still fails the comparison, but it reads as a bug in the probe.
+  got=$(curl -s -o /dev/null -m 15 -w '%{http_code}' $SMOKE_CURL_EXTRA "$url" || true)
   echo "  ${url} -> ${got} (want ${want})"
   [ "$got" = "$want" ] || { echo "ERROR: rollback verification failed" >&2; exit 1; }
 done < <(smoke_probes "$DOMAIN" "$MEDIA_PROBE_PATH")

@@ -425,6 +425,46 @@ check "deploy.sh does NOT reconcile the state rollback.sh repairs" "1" "$?"
 check "deploy.sh scaled nothing" "0" \
   "$(grep -c -- '--scale' "$STUB_DIR/calls.log" || true)"
 
+# --- the auto-rollback branch: a failed smoke check must roll back to the tag
+#     that was serving BEFORE this deploy, which .release-state records as
+#     CURRENT (the file is not rewritten until smoke passes).
+setup_proj
+printf 'CURRENT=goodtag\nPREVIOUS=oldertag\n' > "$PROJ/.release-state"
+cat > "$STUB_DIR/curl" <<'STUB'
+#!/usr/bin/env bash
+echo 503
+STUB
+chmod +x "$STUB_DIR/curl"
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+out=$(bash "$PROJ/scripts/deploy.sh" newtag --skip-backup 2>&1); rc=$?
+check "a failed smoke check fails the deploy" "1" "$rc"
+check "the rollback targets CURRENT, not PREVIOUS" "1" \
+  "$(grep -c 'rolling back to goodtag' <<<"$out" || true)"
+check "it does NOT target PREVIOUS" "0" \
+  "$(grep -c 'rolling back to oldertag' <<<"$out" || true)"
+check "release state is NOT advanced past a failed deploy" "0" \
+  "$(grep -c 'CURRENT=newtag' "$PROJ/.release-state" || true)"
+
+# The first-ever deploy leaves PREVIOUS empty. A failing second deploy must
+# still find CURRENT and roll back, not give up.
+setup_proj
+printf 'CURRENT=goodtag\nPREVIOUS=\n' > "$PROJ/.release-state"
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+out=$(bash "$PROJ/scripts/deploy.sh" newtag --skip-backup 2>&1) || true
+check "an empty PREVIOUS does not defeat the auto-rollback" "1" \
+  "$(grep -c 'rolling back to goodtag' <<<"$out" || true)"
+
+# Restore the 200-returning curl stub for anything that follows.
+cat > "$STUB_DIR/curl" <<'STUB'
+#!/usr/bin/env bash
+echo 200
+STUB
+chmod +x "$STUB_DIR/curl"
+
 # ---------------------------------------------------------------------------
 # service_labels_match: the guard for Traefik's "one service, one definition"
 # rule. Traefik discards a service outright when its containers disagree, so a

@@ -168,19 +168,46 @@ smoke_failed=false
 while IFS= read -r probe; do
   url=${probe%%|*}; want=${probe##*|}
   # shellcheck disable=SC2086  # SMOKE_CURL_EXTRA is a deliberate argument list
-  got=$(curl -s -o /dev/null -m 15 -w '%{http_code}' $SMOKE_CURL_EXTRA "$url" || echo 000)
+  # `|| true`, not `|| echo 000`: curl already prints 000 on a connection
+  # failure AND exits non-zero, so `|| echo 000` yields the string "000000".
+  # It still fails the comparison, but it reads as a bug in the probe.
+  got=$(curl -s -o /dev/null -m 15 -w '%{http_code}' $SMOKE_CURL_EXTRA "$url" || true)
   echo "  ${url} -> ${got} (want ${want})"
   [ "$got" = "$want" ] || smoke_failed=true
 done < <(smoke_probes "$DOMAIN" "$MEDIA_PROBE_PATH")
 
 if [ "$smoke_failed" = true ]; then
-  previous=$(grep '^PREVIOUS=' "$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
+  # Roll back to CURRENT, not PREVIOUS.
+  #
+  # .release-state is deliberately not written until the smoke checks pass, so
+  # while this deploy is failing the file still describes the PREVIOUS release:
+  # its CURRENT is the tag that was serving before this run started, and its
+  # PREVIOUS is the one before that. Reading PREVIOUS here is off by one
+  # release, and wrong in two distinct ways:
+  #
+  #   * After the very first deploy the file is `CURRENT=v1 PREVIOUS=`, so a
+  #     failing second deploy finds nothing to roll back to and leaves the
+  #     broken release serving -- with a known-good tag sitting in the file.
+  #   * After `CURRENT=v2 PREVIOUS=v1`, a failing v3 rolls back to v1, skipping
+  #     v2 entirely. The expand/contract rule that makes an image-only rollback
+  #     safe holds for ONE release, so v1's code would then run against v3's
+  #     migrated schema -- the exact hazard rollback.sh says cannot happen.
+  #
+  # The PREVIOUS fallback stays for the case where a hand-edited or partially
+  # written state file has no CURRENT.
+  rollback_target=$(grep '^CURRENT=' "$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
+  [ -n "$rollback_target" ] || \
+    rollback_target=$(grep '^PREVIOUS=' "$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
   echo "ERROR: smoke checks failed." >&2
-  if [ -n "$previous" ]; then
-    echo ">>> rolling back to ${previous}" >&2
-    bash scripts/rollback.sh "$previous" </dev/null
+  if [ -n "$rollback_target" ]; then
+    # No announcement here: rollback.sh prints its own ">>> rolling back to
+    # ${TARGET}" as its first line, so echoing the same text again would just
+    # duplicate it -- and duplicate output on the one path that decides
+    # whether a bad release keeps serving is exactly the kind of noise that
+    # makes an incident harder to read, not easier.
+    bash scripts/rollback.sh "$rollback_target" </dev/null
   else
-    echo "No PREVIOUS in ${STATE_FILE}; manual intervention required." >&2
+    echo "No usable tag in ${STATE_FILE}; manual intervention required." >&2
   fi
   exit 1
 fi
