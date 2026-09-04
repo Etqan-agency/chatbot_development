@@ -6,8 +6,6 @@ http:
       headers:
         customRequestHeaders:
           X-Forwarded-Proto: "https"
-        hostsProxyHeaders:
-          - "X-CSRFToken"
 
     secure-headers:
       headers:

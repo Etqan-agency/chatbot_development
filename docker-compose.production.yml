@@ -26,7 +26,7 @@ services:
     # docker-labeled router/service. Fixed upstream by auto-negotiation
     # (traefik/traefik#12253, merged into the v3.6 branch) -- verified
     # against this exact traefik.yml + socket-proxy with no other changes.
-    image: traefik:v3.6
+    image: traefik:v3.6.25
     restart: unless-stopped
     ports:
       - "80:80"
