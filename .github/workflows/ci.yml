@@ -22,6 +22,12 @@ jobs:
   changes:
     name: Detect Changes
     runs-on: ubuntu-latest
+    # dorny/paths-filter calls the GitHub API to list a pull request's changed
+    # files, which needs pull-requests: read on top of the workflow's
+    # contents: read default -- without it the API call 403s.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       api: ${{ steps.filter.outputs.api }}
       dashboard: ${{ steps.filter.outputs.dashboard }}
