@@ -30,6 +30,9 @@ write_docker_stub() {
 #!/usr/bin/env bash
 # record every call so tests can assert on ordering
 echo "$*" >> "$STUB_DIR/calls.log"
+# and record the IMAGE_TAG the caller had exported, so a test can prove that a
+# script pinned the tag rather than letting compose read it from .env
+echo "IMAGE_TAG=${IMAGE_TAG:-<unset>} $*" >> "$STUB_DIR/env.log"
 case "$1" in
   ps)
     cat "$STUB_DIR/ps" 2>/dev/null
@@ -111,6 +114,7 @@ reset_stub() { # reset_stub <api-json> [ps-lines...]
   : > "$STUB_DIR/ps"
   [ "$#" -gt 0 ] && printf '%s\n' "$@" > "$STUB_DIR/ps"
   : > "$STUB_DIR/calls.log"
+  : > "$STUB_DIR/env.log"
 }
 
 # Back-compat helper for the parsing tests: API only, no containers.
@@ -415,6 +419,20 @@ check "dashboard converged to 2 replicas" "2" \
 check "rollback.sh recorded the target as CURRENT" "CURRENT=oldtag" \
   "$(grep '^CURRENT=' "$PROJ/.release-state" || true)"
 
+# The OTHER branch of the same write: a manual rollback to a tag that is NOT
+# the recorded CURRENT is a genuine step back, so the tag being left behind
+# becomes PREVIOUS. Only the TARGET == CURRENT case preserves the old PREVIOUS.
+setup_proj
+printf 'CURRENT=badtag\nPREVIOUS=oldtag\n' > "$PROJ/.release-state"
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+bash "$PROJ/scripts/rollback.sh" oldtag >/dev/null 2>&1
+check "a rollback to a DIFFERENT tag shifts CURRENT down" "CURRENT=oldtag" \
+  "$(grep '^CURRENT=' "$PROJ/.release-state" || true)"
+check "a rollback to a DIFFERENT tag records the tag left behind" "PREVIOUS=badtag" \
+  "$(grep '^PREVIOUS=' "$PROJ/.release-state" || true)"
+
 # The repair is opt-in: a deploy from the same dirty state must still refuse.
 setup_proj
 reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
@@ -446,6 +464,17 @@ check "it does NOT target PREVIOUS" "0" \
   "$(grep -c 'rolling back to oldertag' <<<"$out" || true)"
 check "release state is NOT advanced past a failed deploy" "0" \
   "$(grep -c 'CURRENT=newtag' "$PROJ/.release-state" || true)"
+
+# ...and the rollback it triggered must not have DESTROYED the history while
+# recording itself. Its target (goodtag) IS the existing CURRENT, so setting
+# PREVIOUS to the old CURRENT would write `CURRENT=goodtag PREVIOUS=goodtag`
+# and make oldertag unreachable -- after which a blank-tag manual rollback
+# resolves to the release already serving and changes nothing, greenly.
+# This is the auto-rollback's NORMAL path, not an edge case.
+check "a rollback to CURRENT leaves CURRENT at the target" "CURRENT=goodtag" \
+  "$(grep '^CURRENT=' "$PROJ/.release-state" || true)"
+check "a rollback to CURRENT PRESERVES the older PREVIOUS" "PREVIOUS=oldertag" \
+  "$(grep '^PREVIOUS=' "$PROJ/.release-state" || true)"
 
 # The first-ever deploy leaves PREVIOUS empty. A failing second deploy must
 # still find CURRENT and roll back, not give up.
@@ -524,6 +553,59 @@ assert_service_labels web >/dev/null 2>&1
 check "assert fails on drift" "1" "$?"
 mutating=$(grep -cE "compose .* (up|stop|rm) |^stop |^rm " "$STUB_DIR/calls.log" 2>/dev/null || true)
 check "assert mutates nothing when it refuses" "0" "$mutating"
+
+# reconcile_command must name the tag, or an operator copy-pasting it scales up
+# a replica at whatever .env says -- `latest` per .env.example, which CI pushes
+# on every build of main. The `--scale <svc>=<n> <svc>` substring is matched
+# verbatim elsewhere in this suite and must survive intact.
+reconciled=$(reconcile_command web 2)
+check "reconcile_command keeps the --scale substring" "1" \
+  "$(grep -cF -- '--scale web=2 web' <<<"$reconciled" || true)"
+check "reconcile_command names an explicit IMAGE_TAG" "1" \
+  "$(grep -c '^IMAGE_TAG=' <<<"$reconciled" || true)"
+# rollout.sh is sourced here WITHOUT services.sh, so release_current does not
+# exist: the command must still print, with a placeholder rather than a silent
+# `latest`.
+check "reconcile_command never emits a bare latest" "0" \
+  "$(grep -c 'IMAGE_TAG=latest' <<<"$reconciled" || true)"
+
+# ---------------------------------------------------------------------------
+# sync-service-labels.sh must pin IMAGE_TAG to the DEPLOYED release.
+#
+# It runs `compose up --force-recreate`, which replaces every replica. With no
+# IMAGE_TAG exported, compose interpolates it from the server's .env -- `latest`
+# -- so the documented remedy for label drift would silently replace the running
+# release with the newest unreleased build of main.
+# ---------------------------------------------------------------------------
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2
+# Labels already agree, so the script's own post-check passes and the exit
+# status under test is the tag resolution, not the drift verdict.
+stage_labels "$DESIRED_JSON" "chatbot-web-1=$MATCHING" "chatbot-web-2=$MATCHING"
+printf 'CURRENT=deployedtag\nPREVIOUS=oldertag\n' > "$PROJ/.release-state"
+out=$(env -u IMAGE_TAG bash "$PROJ/scripts/sync-service-labels.sh" web 2>&1); rc=$?
+check "sync-service-labels.sh succeeds with a resolvable CURRENT" "0" "$rc"
+check "it announces the tag it pinned" "1" \
+  "$(grep -c 'IMAGE_TAG=deployedtag' <<<"$out" || true)"
+check "every compose call saw the deployed tag exported" "0" \
+  "$(grep -c 'IMAGE_TAG=<unset>' "$STUB_DIR/env.log" || true)"
+check "the force-recreate itself ran at the deployed tag" "1" \
+  "$(grep -cF -- 'IMAGE_TAG=deployedtag compose -f docker-compose.production.yml up -d --no-deps --force-recreate web' \
+     "$STUB_DIR/env.log" || true)"
+
+# ...and with no resolvable CURRENT it must REFUSE, before running anything.
+# There is no safe default: `latest` is the specific wrong answer.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2
+rm -f "$PROJ/.release-state"
+err=$(env -u IMAGE_TAG bash "$PROJ/scripts/sync-service-labels.sh" web 2>&1 >/dev/null); rc=$?
+check "sync-service-labels.sh refuses with no resolvable CURRENT" "1" "$rc"
+check "the refusal says why" "1" \
+  "$(grep -c 'cannot determine the deployed release tag' <<<"$err" || true)"
+check "the refusal ran NO compose command" "0" \
+  "$(grep -c '^compose ' "$STUB_DIR/calls.log" || true)"
+check "the refusal touched no container at all" "0" \
+  "$(grep -c . "$STUB_DIR/calls.log" || true)"
 
 echo "---"; echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

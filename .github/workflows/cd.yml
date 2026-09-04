@@ -48,7 +48,10 @@ jobs:
       checks: read
     steps:
       - name: Wait for CI workflow
-        uses: fountainhead/action-wait-for-check@v1.2.0
+        # Pinned to a full commit SHA, not the movable `v1.2.0` tag: this is the
+        # only gate between a red CI run and a production deploy, and a tag can
+        # be repointed at any commit by whoever controls that repository.
+        uses: fountainhead/action-wait-for-check@5a908a24814494009c4bb27c242ea38c93c593be # v1.2.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           checkName: 'CI Summary'
@@ -214,6 +217,11 @@ jobs:
         env:
           TAG: ${{ needs.verify-images.outputs.image_tag }}
           DOMAIN: ${{ vars.DOMAIN }}
+          # Routed through env: like every other interpolation in this file,
+          # rather than spliced into the run: block. github.actor is not
+          # attacker-controlled here, but "no ${{ }} inside a run: body" is a
+          # rule that only works if it has no exceptions to argue about.
+          ACTOR: ${{ github.actor }}
         run: |
           {
             echo "## Deployment Successful"
@@ -224,7 +232,7 @@ jobs:
             echo "| API | https://api.${DOMAIN} |"
             echo ""
             echo "**Image Tag:** \`${TAG}\`"
-            echo "**Triggered by:** ${{ github.actor }}"
+            echo "**Triggered by:** ${ACTOR}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Failure guidance
@@ -239,11 +247,25 @@ jobs:
             echo "If it failed BEFORE the smoke checks -- preflight, migrate, a roll"
             echo "that timed out -- nothing was rolled back and nothing was healed."
             echo ""
-            echo "### Rollback"
+            echo "### Rollback after a failure BEFORE the smoke checks"
             echo ""
-            echo "1. Actions -> **Rollback** -> Run workflow"
-            echo "2. Leave the tag blank to roll back to PREVIOUS from .release-state,"
-            echo "   or enter a specific previously-working image tag"
+            echo "\`.release-state\` has NOT been advanced, so its \`CURRENT\` still names"
+            echo "the release that was serving before this run started."
+            echo ""
+            echo "1. On the server: \`cat \${DEPLOY_PATH}/.release-state\`"
+            echo "2. Actions -> **Rollback** -> Run workflow"
+            echo "3. Enter the tag named by **CURRENT**."
+            echo ""
+            echo "Do **not** leave the tag blank here. Blank means PREVIOUS, which in"
+            echo "this state is release N-2 -- and \`migrate\` may already have applied"
+            echo "release N's schema. Expand/contract only guarantees compatibility"
+            echo "ONE release back, so N-2 code on N schema is exactly the breakage"
+            echo "the pipeline exists to prevent."
+            echo ""
+            echo "### Rollback after a SUCCESSFUL deploy that turned out bad"
+            echo ""
+            echo "\`.release-state\` has been advanced, so \`PREVIOUS\` is correct:"
+            echo "leave the tag blank, or enter a specific known-good tag."
             echo ""
             echo "Do NOT re-run CD with an older tag: that is a *deploy* of that tag"
             echo "(collectstatic, migrate, release-state bookkeeping), not a rollback."
