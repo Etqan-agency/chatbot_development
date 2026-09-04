@@ -175,6 +175,11 @@ types something exotic (spaces, shell metacharacters, a registry path with a
 colon) gets a clean refusal at the "Roll back" step rather than a mysterious
 downstream failure.
 
+**Blank is only correct after a deploy that SUCCEEDED and was then found bad.**
+If you are recovering from a deploy that failed *before* its smoke checks,
+`.release-state` has not been advanced and blank resolves one release too far
+back — enter the tag named by `CURRENT` instead. See §6.
+
 **Why the manual default is `PREVIOUS` here but `deploy.sh`'s own
 auto-rollback (§4) reads `CURRENT` — this is not a bug, the two run at
 different times against different states of `.release-state`.** `.release-state`
@@ -223,16 +228,30 @@ ERROR: web has N running replicas, expected 2.
 The reconcile command it prints, and the one to run by hand, is:
 
 ```bash
-docker compose -f docker-compose.production.yml up -d --no-deps --no-recreate --scale web=2 web
+IMAGE_TAG=<the currently deployed tag> docker compose -f docker-compose.production.yml up -d --no-deps --no-recreate --scale web=2 web
 ```
 
-(substitute `dashboard`/2 or the affected service and its steady count).
-**`--no-recreate` matters.** Without it, compose sees that `IMAGE_TAG` has
-moved since the surviving containers were created and recreates them too —
-which stops and restarts every replica of the service at once, i.e. exactly
-the non-rolling restart this whole pipeline exists to avoid. `--no-recreate`
-tells compose to leave the existing containers alone and only create the
-ones needed to reach the target count.
+(substitute `dashboard`/2 or the affected service and its steady count). The
+scripts fill in the tag for you — `assert_steady_replicas` and
+`reconcile_service` read `CURRENT` from `.release-state` and print it inline,
+so the line in the error message is copy-pasteable as printed. If it prints
+the placeholder instead, `.release-state` could not be read; get the tag with
+`cat .release-state` or `docker inspect` on a surviving replica.
+
+**Both halves of that line matter, for mirror-image reasons.**
+
+`--no-recreate` protects the containers that already exist. Without it,
+compose sees that `IMAGE_TAG` has moved since the surviving containers were
+created and recreates them too — which stops and restarts every replica of
+the service at once, i.e. exactly the non-rolling restart this whole pipeline
+exists to avoid.
+
+The explicit `IMAGE_TAG=` decides what the **scale-up** creates. Without it,
+compose interpolates `IMAGE_TAG` from the server's `.env`, which is `latest`
+(see `.env.example`), and CI pushes `latest` on every build of `main`. The new
+replica would come up on the newest *unreleased* `main` build while its
+siblings stayed on the deployed release — a mixed-version service, possibly
+running code whose migrations have not been applied.
 
 Running the reconcile command by hand fixes the replica count but leaves the
 deploy that was interrupted un-retried. In most cases, **running a rollback is
@@ -241,6 +260,61 @@ steady first if there are too many, up if there are too few) as part of its
 normal flow, then rolls to the target tag and re-verifies with the smoke
 checks — one action that both fixes the replica count and confirms the site
 is serving correctly.
+
+### Which tag to roll back to after an interrupted deploy
+
+**A failure *before* the smoke checks: enter the tag named by `CURRENT` in
+`.release-state`. Do not leave the tag blank.**
+
+`.release-state` is only rewritten after smoke checks pass (§5), so a deploy
+that died in the preflight, in `migrate`, or in a roll that timed out has not
+advanced it: `CURRENT` still names the release that was serving before the run
+started, and `PREVIOUS` names the one before *that*.
+
+Leaving the tag blank resolves to `PREVIOUS`, which here is release N−2. If
+`migrate` had already run, release N's schema is live — and expand/contract
+only guarantees that a schema is compatible **one** release back. N−2 code on
+N schema is precisely the breakage the pipeline exists to prevent.
+
+```bash
+# on the server
+cat "${DEPLOY_PATH}/.release-state"
+# -> CURRENT=<enter this one>   PREVIOUS=<not this one>
+```
+
+Blank (i.e. `PREVIOUS`) is correct only in the other case: a deploy that
+*succeeded*, advanced `.release-state`, and turned out bad afterwards.
+
+### A leftover one-off container
+
+`deploy.sh` runs `collectstatic`, `migrate` and the media-probe write as
+`docker compose run --rm` one-off containers. Compose names those
+`chatbot-web-run-<hash>`, and `service_containers` matches on the
+`chatbot-<service>-` prefix — so a run killed *during* `migrate` (`--rm` never
+fires) leaves a container that the preflight counts as a `web` replica:
+
+```
+ERROR: web has 3 running replicas, expected 2.
+```
+
+The reconcile command will **not** fix this. `--scale web=2` counts and
+removes only the containers compose considers replicas of the service; the
+one-off is not one, so the scale is a no-op and the preflight fails again with
+the same message.
+
+Spot it by the name, then remove it by hand:
+
+```bash
+docker ps --format '{{.Names}}' | grep -- '-run-'
+# chatbot-web-run-7f3a91c0d2e4
+docker rm -f chatbot-web-run-7f3a91c0d2e4
+```
+
+Check first that it really is dead and not a `migrate` still running against
+the database (`docker logs <name>`); killing a live migration mid-transaction
+is a different and worse problem. Postgres will roll back an interrupted
+transaction, but a migration split across several is not atomic as a whole.
+Once the one-off is gone, re-check the count and proceed.
 
 ## 7. Service-label drift
 
@@ -269,10 +343,48 @@ it's the correct trade: the alternative (rolling anyway, into a Traefik-wide
 404) is a longer and harder-to-diagnose outage. Once it has run, rolling
 deploys are zero-downtime again for that service.
 
+The script pins `IMAGE_TAG` to `CURRENT` from `.release-state` and prints it:
+
+```
+>>> recreating at the deployed release tag IMAGE_TAG=<tag>
+```
+
+That pin is not cosmetic. `--force-recreate` replaces every replica, and
+without an explicit tag compose would read `IMAGE_TAG` from the server's
+`.env` — `latest`, which CI pushes on every build of `main` — and this
+"remedy for label drift" would quietly replace the running release with the
+newest unreleased build, migrations or no migrations.
+
+If `.release-state` cannot be read the script **refuses** rather than
+defaulting, because there is no safe default. Name the tag yourself:
+
+```bash
+IMAGE_TAG=<deployed-tag> bash scripts/sync-service-labels.sh <service>
+```
+
+`rollback.sh` also checks label parity, but only **warns** — it names this
+script and continues. Refusing there would block the recovery path with a
+condition rollback exists to recover from, the same reasoning that makes a
+rollback reconcile replica counts instead of asserting them. A rollback is in
+fact where drift is *most* likely: `cd.yml` rsyncs the new
+`docker-compose.production.yml` to the server **before** `deploy.sh` runs, so
+a deploy that fails after that sync leaves new compose beside old containers.
+If a rollback's verification fails with 404s and this warning is in the log,
+that is the cause.
+
 ## 8. Known residuals
 
 These are accepted trade-offs, not oversights. Each has a bound on its blast
 radius; none is scheduled to be fixed as of this writing.
+
+**What "zero-downtime" has actually been measured to mean here.** A local
+rehearsal of a full rolling deploy served **400/400 requests with none
+dropped**. That measurement was taken against `api.${DOMAIN}` — i.e. **through
+Traefik**, which is the path with health-aware routing and the drain-aware
+`/health/` route. The `app.${DOMAIN}/api/` path, where the dashboard's nginx
+proxies to `web:8000` over Docker DNS and bypasses Traefik entirely, was
+**not** measured. That is the path carrying the 10-second resolver residual
+described below, so the 400/400 result should not be read as covering it.
 
 - **`dashboard` is not drainable.** `web` has a drain-aware `/health/` route
   (returns 503 while a marker file exists, so Traefik pulls it from rotation
@@ -290,14 +402,25 @@ radius; none is scheduled to be fixed as of this writing.
   (`valid=10s`), independent of Traefik's own health-aware routing. When a
   `web` replica is retired, any `dashboard` container whose resolver cache
   still points at that replica's now-dead IP will proxy to it and return 502,
-  for up to 10 seconds, until its cache expires and re-resolves. This is why
-  the roll order in `scripts/lib/services.sh` matters: rolling `dashboard`
-  *immediately after* `web` replaces every `dashboard` container with one
-  that has an empty resolver cache, which bounds the exposure to the gap
-  between the two rolls rather than to the DNS TTL of long-lived containers.
-  The complete fix — routing dashboard→API traffic through Traefik instead of
-  directly to `web` over Docker DNS — is not done and is not currently
-  scheduled.
+  for up to 10 seconds, until its cache expires and re-resolves.
+
+  **The bound is the 10 seconds, and it comes from `valid=10s` — not from the
+  roll order.** An earlier version of this document (and of the comment in
+  `scripts/lib/services.sh`) claimed that rolling `dashboard` immediately
+  after `web` bounded the exposure to the gap between the two rolls. That is
+  not how it works. `valid=10s` expires a cached entry 10 seconds after it was
+  taken, in a long-lived container exactly as in a fresh one, so there is no
+  "DNS TTL of long-lived containers" to improve on. And the old `dashboard`
+  replicas — the ones holding the stale caches — keep serving right through
+  the new dashboard generation's warm-up, which takes longer than 10 seconds,
+  so they have re-resolved on their own before they are retired. The roll
+  order is web-before-dashboard because dashboard is downstream of web; it is
+  not what produces the bound.
+
+  This residual is on the `app.${DOMAIN}/api/` path only, and it is the path
+  the 400/400 rehearsal did **not** measure (see above). The complete fix —
+  routing dashboard→API traffic through Traefik instead of directly to `web`
+  over Docker DNS — is not done and is not currently scheduled.
 
 - **`SECURE_SSL_REDIRECT` must stay `False`** in the server's `.env`. Traefik
   terminates TLS at the edge and talks to `web` over plain HTTP, including for

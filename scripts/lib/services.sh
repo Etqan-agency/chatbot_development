@@ -21,13 +21,20 @@
 #                 retire_container waits out the settle window against a probe
 #                 that never fails and the stop is as abrupt as before.
 #
-# ORDER MATTERS, and not only for the usual reason. The dashboard's nginx
-# proxies /api/ straight to `web:8000` over Docker DNS, bypassing Traefik, and
-# caches that resolution for 10s. Retiring a web replica therefore leaves up to
-# 10s of dead IPs in each running dashboard container's resolver cache. Rolling
-# `dashboard` immediately afterwards replaces those containers with ones that
-# have empty caches, which bounds the exposure to the gap between the two rolls
-# rather than to the DNS TTL of long-lived containers. See docs/DEPLOY.md.
+# ORDER: web before dashboard, because dashboard is downstream of web. The
+# dashboard's nginx proxies /api/ straight to `web:8000` over Docker DNS,
+# bypassing Traefik, so rolling web first means the new dashboard generation
+# comes up against an API already on the new release.
+#
+# It is NOT the roll order that bounds the stale-DNS residual, and this comment
+# used to claim otherwise. What bounds it is nginx's `resolver ... valid=10s`:
+# a cached entry expires 10s after it was taken, in a long-lived container as
+# much as a fresh one, so a dashboard replica proxying to a retired web
+# replica's dead IP does so for at most 10s and then re-resolves. Rolling
+# dashboard next does not shorten that window -- the OLD dashboard replicas,
+# stale caches and all, keep serving right through the new generation's
+# warm-up, which is longer than 10s. The 10s bound is real; the roll order is
+# not what produces it. See docs/DEPLOY.md §8.
 # `export` here is for shellcheck's benefit, not bash's: this file is always
 # sourced into the caller's shell, never exec'd, so the array is already in
 # scope without it. Without the marker, `shellcheck -x` on services.sh in
