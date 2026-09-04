@@ -601,7 +601,7 @@ check "the loopback probes carry a Host header field" "2" \
 # Both loopback lines carry the overridden gateway URL, hence 2, not 1.
 # shellcheck source=SCRIPTDIR/services.sh
 check "the gateway URL is overridable" "2" \
-  "$(source ./services.sh && smoke_probes a.test b.test t.txt http://127.0.0.1:9999 | grep -c '9999' || true)"
+  "$( { source ./services.sh; smoke_probes a.test b.test t.txt http://127.0.0.1:9999; } | grep -c '9999' || true)"
 
 # ---------------------------------------------------------------------------
 # service_labels_match: the guard for Traefik's "one service, one definition"

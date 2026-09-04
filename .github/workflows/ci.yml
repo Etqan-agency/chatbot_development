@@ -156,7 +156,20 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+        # Pinned, not `apt-get install shellcheck`. Ubuntu's package is 0.9.0
+        # while a developer's local install is typically the current release,
+        # and the two disagree: 0.9.0 reports SC2015 inside a command
+        # substitution where 0.11.0 does not. That divergence turned "shellcheck
+        # clean locally" into a claim CI could still reject -- which is exactly
+        # what happened on this job's first real run. Pin it so local and CI
+        # can only ever agree, and bump this deliberately.
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+        run: |
+          curl -sSL "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJ -C /tmp
+          sudo install "/tmp/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version | grep '^version:' 
 
       - name: Shellcheck
         # -x follows `source` directives so lib/ is analysed in context, which
