@@ -233,8 +233,11 @@ jobs:
           {
             echo "## Deployment FAILED"
             echo ""
-            echo "deploy.sh auto-rolls-back to PREVIOUS when the smoke checks fail."
-            echo "If it failed BEFORE the smoke checks, nothing was rolled back."
+            echo "deploy.sh auto-rolls-back when the SMOKE CHECKS fail, to CURRENT"
+            echo "from .release-state -- the tag that was serving before this run"
+            echo "(the file is not rewritten until smoke passes)."
+            echo "If it failed BEFORE the smoke checks -- preflight, migrate, a roll"
+            echo "that timed out -- nothing was rolled back and nothing was healed."
             echo ""
             echo "### Rollback"
             echo ""

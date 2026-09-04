@@ -175,6 +175,21 @@ types something exotic (spaces, shell metacharacters, a registry path with a
 colon) gets a clean refusal at the "Roll back" step rather than a mysterious
 downstream failure.
 
+**Why the manual default is `PREVIOUS` here but `deploy.sh`'s own
+auto-rollback (§4) reads `CURRENT` — this is not a bug, the two run at
+different times against different states of `.release-state`.** `.release-state`
+is only rewritten after smoke checks pass. When `deploy.sh` is deciding
+whether to auto-rollback, that write has not happened yet for the run that is
+failing, so the file's `CURRENT` still names the release that was actually
+serving before this run started — reading `CURRENT` is correct there.
+Running the Rollback workflow by hand, by contrast, normally happens some
+time *after* a deploy has already succeeded and rewritten `.release-state`,
+so by then `CURRENT` names the release you are trying to get away from and
+`PREVIOUS` names the one to go back to — reading `PREVIOUS` is correct there.
+Both scripts are reading the field that names "the release that was serving
+before the thing you're recovering from," it is just a different field
+depending on whether `.release-state` has been advanced yet.
+
 **Do not re-run CD with an older tag as a way to "roll back."** That is a
 *deploy* of that tag: it runs `collectstatic`, `migrate` and the
 `.release-state` bookkeeping exactly like any other deploy, against a database
