@@ -52,6 +52,24 @@ APP_SERVICES=(
 # fallback the caller writes ever runs.
 envval() { grep -E "^${1}=" .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"'" || true; }
 
+# The tag that is CURRENTLY DEPLOYED, from .release-state. Prints nothing when
+# the file is missing, unwritten (before the first successful deploy) or has no
+# CURRENT line -- callers must treat empty as "unknown" and refuse, never as a
+# reason to fall back to a default.
+#
+# This exists because `.env`'s IMAGE_TAG is NOT the deployed tag. .env.example
+# ships `IMAGE_TAG=latest`, and ci.yml pushes `type=raw,value=latest` on every
+# build of main, so any compose command that does not export IMAGE_TAG creates
+# containers at the newest unreleased main build -- possibly one whose
+# migrations have not run. deploy.sh and rollback.sh both export IMAGE_TAG for
+# exactly this reason; every other path that runs `compose up` needs a tag too,
+# and this is where it comes from.
+#
+# `|| true` for the same pipefail reason as envval above.
+release_current() {
+  grep '^CURRENT=' "${STATE_FILE:-.release-state}" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
 # The probes that gate a deploy and verify a rollback, as "<url>|<want>".
 # ONE definition, so a rollback can never verify less than the deploy gated on.
 #

@@ -128,12 +128,29 @@ retire_container() {
 
 # The command that brings a service back to its steady replica count by hand.
 # Single definition so every message that prints it -- roll_service's refusal,
-# the deploy preflight, docs/deployment.md -- says the same thing.
+# the deploy preflight, docs/DEPLOY.md -- says the same thing.
 #
 # --no-recreate matters: without it compose recreates the surviving replicas
 # because IMAGE_TAG has moved, which is a non-rolling restart of the service.
+#
+# The leading IMAGE_TAG= matters just as much, and for the mirror-image reason.
+# --no-recreate protects the containers that already exist; the explicit tag
+# decides what the SCALE-UP creates. Without it compose interpolates IMAGE_TAG
+# from the server's .env, which is `latest` per .env.example, and ci.yml pushes
+# `latest` on every build of main -- so an operator copy-pasting this line to
+# repair a replica count would bring the new replica up on the newest
+# unreleased main build while its siblings stay on the deployed release.
+#
+# `declare -F` rather than calling release_current unconditionally: rollout.sh
+# is application-agnostic and is sourced (and unit-tested) without services.sh.
+# When the tag cannot be resolved the command still prints, with an obvious
+# placeholder the operator must replace -- never a silent `latest`.
 reconcile_command() {
-  echo "docker compose -f ${COMPOSE_FILE} up -d --no-deps --no-recreate --scale ${1}=${2} ${1}"
+  local tag=""
+  if declare -F release_current >/dev/null 2>&1; then
+    tag=$(release_current)
+  fi
+  echo "IMAGE_TAG=${tag:-<the currently deployed tag, see .release-state>} docker compose -f ${COMPOSE_FILE} up -d --no-deps --no-recreate --scale ${1}=${2} ${1}"
 }
 
 # Assert that every service is at its steady replica count, or return 1.
