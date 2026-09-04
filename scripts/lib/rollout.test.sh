@@ -465,16 +465,12 @@ check "it does NOT target PREVIOUS" "0" \
 check "release state is NOT advanced past a failed deploy" "0" \
   "$(grep -c 'CURRENT=newtag' "$PROJ/.release-state" || true)"
 
-# ...and the rollback it triggered must not have DESTROYED the history while
-# recording itself. Its target (goodtag) IS the existing CURRENT, so setting
-# PREVIOUS to the old CURRENT would write `CURRENT=goodtag PREVIOUS=goodtag`
-# and make oldertag unreachable -- after which a blank-tag manual rollback
-# resolves to the release already serving and changes nothing, greenly.
-# This is the auto-rollback's NORMAL path, not an edge case.
-check "a rollback to CURRENT leaves CURRENT at the target" "CURRENT=goodtag" \
-  "$(grep '^CURRENT=' "$PROJ/.release-state" || true)"
-check "a rollback to CURRENT PRESERVES the older PREVIOUS" "PREVIOUS=oldertag" \
-  "$(grep '^PREVIOUS=' "$PROJ/.release-state" || true)"
+# NOTE: no .release-state assertion here beyond the one above. The curl stub in
+# this fixture returns 503, so the rollback this deploy triggers fails its own
+# verification and exits BEFORE the state write. Anything asserted about
+# PREVIOUS at this point is reading the untouched fixture file and would pass
+# whether or not rollback.sh preserves it. The real guard is the dedicated
+# case below, once the 200-returning stub is back.
 
 # The first-ever deploy leaves PREVIOUS empty. A failing second deploy must
 # still find CURRENT and roll back, not give up.
@@ -493,6 +489,32 @@ cat > "$STUB_DIR/curl" <<'STUB'
 echo 200
 STUB
 chmod +x "$STUB_DIR/curl"
+
+# --- I2: a rollback whose TARGET IS the recorded CURRENT must PRESERVE the
+#     existing PREVIOUS, not overwrite it with the target.
+#
+# This is the auto-rollback's NORMAL path: deploy.sh picks CURRENT precisely
+# because .release-state has not been advanced, so TARGET == CURRENT every
+# time. Setting PREVIOUS to the old CURRENT there writes
+# `CURRENT=goodtag PREVIOUS=goodtag` and makes oldertag unreachable -- after
+# which the operator's blank-tag manual rollback resolves to the release
+# already serving, verifies fine, and reports green having changed nothing.
+#
+# Driven directly rather than through a failing deploy, and with the
+# 200-returning curl stub, so rollback.sh actually REACHES its state write.
+# Asserted from the fixture's own distinct values (goodtag/oldertag), so the
+# check fails if the write collapses them onto one tag.
+setup_proj
+printf 'CURRENT=goodtag\nPREVIOUS=oldertag\n' > "$PROJ/.release-state"
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+bash "$PROJ/scripts/rollback.sh" goodtag >/dev/null 2>&1
+check "a rollback to CURRENT reached its state write" "0" "$?"
+check "a rollback to CURRENT leaves CURRENT at the target" "CURRENT=goodtag" \
+  "$(grep '^CURRENT=' "$PROJ/.release-state" || true)"
+check "a rollback to CURRENT PRESERVES the older PREVIOUS" "PREVIOUS=oldertag" \
+  "$(grep '^PREVIOUS=' "$PROJ/.release-state" || true)"
 
 # ---------------------------------------------------------------------------
 # service_labels_match: the guard for Traefik's "one service, one definition"
