@@ -179,10 +179,28 @@ jobs:
       - name: Validate the compose file renders
         # Catches a malformed label or an unbalanced quote before it reaches the
         # server, where the same error aborts a deploy mid-rollout.
+        #
+        # `cp .env.example .env`, NOT `touch .env`. `web` and `worker` declare
+        # `env_file: .env` and .env is gitignored, so a clean checkout has none
+        # and compose hard-errors ("env file ... not found") before it renders
+        # anything -- this step would fail on every run.
+        #
+        # Copying the example rather than creating an empty file makes the step
+        # additionally prove that .env.example is SUFFICIENT to render the
+        # compose file: a variable added to docker-compose.production.yml but
+        # never documented in .env.example fails here, so the two cannot drift.
+        # An empty .env would satisfy compose and prove nothing.
+        #
+        # DOMAIN is deliberately NOT in `env:` any more -- it comes from the
+        # copied .env.example, which is the point. POSTGRES_PASSWORD stays,
+        # because .env.example ships it EMPTY on purpose (it is a secret to be
+        # filled in at provisioning) and the compose file guards it with
+        # `${POSTGRES_PASSWORD:?...}`, which rejects empty as well as unset.
         env:
-          DOMAIN: example.com
           POSTGRES_PASSWORD: ci-render-only
-        run: docker compose -f docker-compose.production.yml config > /dev/null
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.production.yml config > /dev/null
 
   rollout-tests:
     name: Rollout Primitive Tests
