@@ -1,0 +1,75 @@
+log:
+  level: INFO
+
+accessLog:
+  filePath: "/var/log/traefik/access.log"
+  format: json
+  bufferingSize: 100
+  filters:
+    statusCodes:
+      - "200-599"
+  fields:
+    defaultMode: keep
+    headers:
+      defaultMode: drop
+      names:
+        User-Agent: keep
+        Content-Type: keep
+        X-Forwarded-For: keep
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: web-secure
+          scheme: https
+          permanent: true
+
+  web-secure:
+    address: ":443"
+
+  # Container-local ONLY. Traefik's API exposes the entire routing
+  # configuration, so this must never bind 0.0.0.0 or be published: binding
+  # 127.0.0.1 means only a process inside this container's network namespace
+  # (i.e. `docker exec`) can read it.
+  traefik:
+    address: "127.0.0.1:8080"
+
+# Read-only view of the live routing configuration. Plan 3's rolling deploy
+# queries /api/http/services/<name>@docker to learn whether Traefik considers a
+# new replica UP, rather than inferring it from container health and a timer.
+api:
+  dashboard: false
+  insecure: true
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: etqan.agency.company@gmail.com
+      storage: /etc/traefik/acme/acme.json
+      httpChallenge:
+        entryPoint: web
+
+providers:
+  # Dynamic config lives in its own directory and hot-reloads. Pointing this at
+  # a single file (or at traefik.yml itself) means every routing change needs a
+  # full Traefik restart.
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+  # Routers and services also come from container labels, so replicas are
+  # discovered as they start and retired as they stop. Nothing is exposed
+  # unless it opts in with `traefik.enable=true`.
+  docker:
+    endpoint: "tcp://socket-proxy:2375"
+    exposedByDefault: false
+    network: chatbot_default
+    # Defence in depth behind the `-l traefik.enable=false` flag Plan 3 puts on
+    # one-off containers. A `docker compose run` container inherits its
+    # service's labels; without this it registers as an extra backend with
+    # nothing listening. Ordinary compose containers carry oneoff=False, so
+    # this matches them and excludes only one-offs.
+    constraints: "Label(`com.docker.compose.oneoff`,`False`)"
