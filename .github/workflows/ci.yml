@@ -48,6 +48,7 @@ jobs:
               - 'docker-compose.production.yml'
               - 'traefik/**'
               - 'media/**'
+              - 'scripts/**'
               - '.github/workflows/**'
 
   api-lint:
@@ -146,11 +147,138 @@ jobs:
         working-directory: chatbot_dashboard
         run: npm run build
 
+  infra-lint:
+    name: Infra Linting
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.infra == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Shellcheck
+        # -x follows `source` directives so lib/ is analysed in context, which
+        # is the only way the deploy scripts' use of rollout.sh functions is
+        # checked at all.
+        run: shellcheck -x scripts/*.sh scripts/lib/*.sh
+
+      - name: Install actionlint
+        run: |
+          curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
+            | bash -s -- latest /usr/local/bin
+
+      - name: Actionlint
+        # Lints EVERY workflow, including ci.yml itself, and runs shellcheck
+        # over every `run:` block. ci.yml's own summary step had to be brought
+        # up to that standard first -- a gate that fails on its first run is
+        # not a gate, it is a broken build everyone learns to ignore.
+        run: actionlint
+
+      - name: Validate the compose file renders
+        # Catches a malformed label or an unbalanced quote before it reaches the
+        # server, where the same error aborts a deploy mid-rollout.
+        #
+        # `cp .env.example .env`, NOT `touch .env`. `web` and `worker` declare
+        # `env_file: .env` and .env is gitignored, so a clean checkout has none
+        # and compose hard-errors ("env file ... not found") before it renders
+        # anything -- this step would fail on every run.
+        #
+        # Copying the example rather than creating an empty file also lets the
+        # step prove that .env.example is SUFFICIENT to render the compose file,
+        # so the two cannot drift. An empty .env would satisfy compose and prove
+        # nothing.
+        #
+        # That second guarantee needs the warning check below to be real.
+        # `compose config` treats an undefined interpolation as a WARNING --
+        # "The \"DOMAIN\" variable is not set. Defaulting to a blank string." --
+        # and still EXITS 0. Measured: deleting DOMAIN= from .env.example
+        # printed that warning four times and exited 0. Only ONE variable in
+        # docker-compose.production.yml carries a `${VAR:?}` guard
+        # (POSTGRES_PASSWORD), so without this check an exit-status-only step
+        # could not catch an undocumented variable at all, and the claim above
+        # would be false. A blank hostname, port or path renders "successfully"
+        # here and reaches the server the same way.
+        #
+        # DOMAIN is deliberately NOT in `env:` -- it comes from the copied
+        # .env.example, which is the point. POSTGRES_PASSWORD stays, because
+        # .env.example ships it EMPTY on purpose (it is a secret filled in at
+        # provisioning) and the compose file guards it with
+        # `${POSTGRES_PASSWORD:?...}`, which rejects empty as well as unset.
+        env:
+          POSTGRES_PASSWORD: ci-render-only
+        run: |
+          cp .env.example .env
+
+          # 2>&1 >/dev/null: send stderr to the capture, then discard the
+          # rendered YAML. `if !` rather than a bare call so a hard render
+          # error still prints compose's own diagnostic before failing.
+          if ! render_stderr=$(docker compose -f docker-compose.production.yml config 2>&1 >/dev/null); then
+            printf '%s\n' "${render_stderr}" >&2
+            echo "ERROR: docker-compose.production.yml does not render." >&2
+            exit 1
+          fi
+
+          # A here-string, NOT `printf ... | grep`. Under `set -o pipefail`
+          # (which Actions sets for every run: block) grep -q exits on its
+          # first match, printf takes SIGPIPE, and the pipeline reports 141 --
+          # so the check would silently never fire on the very input it exists
+          # to catch.
+          if grep -q 'variable is not set' <<< "${render_stderr}"; then
+            printf '%s\n' "${render_stderr}" >&2
+            echo "ERROR: the compose file interpolates a variable that .env.example" >&2
+            echo "       does not define. Compose defaults it to a blank string and" >&2
+            echo "       still exits 0, so this renders 'successfully' with an empty" >&2
+            echo "       hostname, port or path -- and the same blank would reach the" >&2
+            echo "       server, where it is a mid-deploy failure instead." >&2
+            echo "       Add the variable to .env.example, or give it a default in" >&2
+            echo "       docker-compose.production.yml." >&2
+            exit 1
+          fi
+
+          echo "compose renders, and .env.example defines every variable it interpolates"
+
+  rollout-tests:
+    name: Rollout Primitive Tests
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.infra == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the rollout test suite
+        # Stubs `docker` on PATH; touches no daemon and no network.
+        run: bash scripts/lib/rollout.test.sh
+
   build-api:
     name: Build and Push API Image
     runs-on: ubuntu-latest
     needs: [api-lint, api-test]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Both images must exist at EVERY main SHA: cd.yml deploys one tag for the
+    # whole stack, and a release PR usually bumps a single component's pointer.
+    #
+    # Today api-lint and api-test also carry `|| github.event_name == 'push'`,
+    # so they do not skip on a push and this job would run regardless. This
+    # condition makes that guarantee local instead of inherited: without it,
+    # removing that clause upstream (a plausible way to stop re-running checks
+    # for an unchanged component) would silently skip this build, and the first
+    # symptom would be verify-images failing in CD with no image at that SHA.
+    #
+    # `!= 'failure'` and not `== 'success'`: 'skipped' must pass, while a
+    # genuine lint or test failure must still block. The layer cache makes an
+    # unchanged rebuild cheap.
+    #
+    # always() && !cancelled(): always() alone would also run this job when the
+    # workflow run is cancelled; !cancelled() excludes that case. The two are
+    # partly redundant (!cancelled() alone implies everything always() adds
+    # except running on cancellation), but always() is kept explicit here so
+    # the intent -- "run regardless of needs' skip/success status" -- reads
+    # directly off the condition rather than through cancelled()'s negation.
+    if: >-
+      always() && !cancelled()
+      && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.api-lint.result != 'failure' && needs.api-test.result != 'failure'
     permissions:
       contents: read
       packages: write
@@ -187,7 +315,10 @@ jobs:
     name: Build and Push Dashboard Image
     runs-on: ubuntu-latest
     needs: [dashboard-checks]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Same shape as build-api's if -- see the comment there for why.
+    if: >-
+      always() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.dashboard-checks.result != 'failure'
     permissions:
       contents: read
       packages: write
@@ -223,19 +354,36 @@ jobs:
   ci-summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [build-api, build-dashboard]
+    needs: [build-api, build-dashboard, infra-lint, rollout-tests]
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Summarise
         run: |
-          echo "## CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| API | ${{ needs.build-api.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Dashboard | ${{ needs.build-dashboard.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## CI Pipeline Summary"
+            echo ""
+            echo "| Component | Status |"
+            echo "|-----------|--------|"
+            echo "| API | ${{ needs.build-api.result }} |"
+            echo "| Dashboard | ${{ needs.build-dashboard.result }} |"
+            echo "| Infra lint | ${{ needs.infra-lint.result }} |"
+            echo "| Rollout tests | ${{ needs.rollout-tests.result }} |"
+            echo ""
+            echo "**Commit:** \`${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Fail if any build failed
         if: needs.build-api.result != 'success' || needs.build-dashboard.result != 'success'
         run: exit 1
+      - name: Fail if infra checks failed
+        # skipped counts as passing here: infra-lint and rollout-tests do not
+        # run on an API-only or dashboard-only change, and treating that skip
+        # as a failure would block every such PR.
+        run: |
+          if [ "${{ needs.infra-lint.result }}" != "success" ] && \
+             [ "${{ needs.infra-lint.result }}" != "skipped" ]; then
+            echo "Infra linting failed"; exit 1
+          fi
+          if [ "${{ needs.rollout-tests.result }}" != "success" ] && \
+             [ "${{ needs.rollout-tests.result }}" != "skipped" ]; then
+            echo "Rollout primitive tests failed"; exit 1
+          fi

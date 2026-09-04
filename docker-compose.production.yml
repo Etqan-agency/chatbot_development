@@ -1,3 +1,10 @@
+# Pins the compose project name, and with it every container name.
+# scripts/lib/rollout.sh matches containers by the `chatbot-<service>-<n>`
+# prefix and execs into `chatbot-traefik-1`. Left unpinned, the project name is
+# the basename of the deploy directory -- which on the server is DEPLOY_PATH,
+# a secret this repo cannot see. Every roll would then find zero containers.
+name: chatbot
+
 networks:
   # Named explicitly to pin it: traefik.yml's providers.docker.network
   # references chatbot_default by name, and every service that does not name a
@@ -133,6 +140,11 @@ services:
     image: ghcr.io/etqan-agency/chatbot/api:${IMAGE_TAG:-latest}
     restart: unless-stopped
     command: ["celery", "-A", "Conf", "worker", "-l", "info", "--concurrency", "2"]
+    # Celery treats SIGTERM as a warm shutdown: finish the current task, stop
+    # prefetching, exit. The default 10s SIGKILLs mid-task. roll_worker passes
+    # -t 360 explicitly; this covers every path that does not (compose down,
+    # host reboot, manual restart).
+    stop_grace_period: 360s
     env_file: .env
     volumes:
       - media_volume:/app/media

