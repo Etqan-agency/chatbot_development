@@ -185,22 +185,59 @@ jobs:
         # and compose hard-errors ("env file ... not found") before it renders
         # anything -- this step would fail on every run.
         #
-        # Copying the example rather than creating an empty file makes the step
-        # additionally prove that .env.example is SUFFICIENT to render the
-        # compose file: a variable added to docker-compose.production.yml but
-        # never documented in .env.example fails here, so the two cannot drift.
-        # An empty .env would satisfy compose and prove nothing.
+        # Copying the example rather than creating an empty file also lets the
+        # step prove that .env.example is SUFFICIENT to render the compose file,
+        # so the two cannot drift. An empty .env would satisfy compose and prove
+        # nothing.
         #
-        # DOMAIN is deliberately NOT in `env:` any more -- it comes from the
-        # copied .env.example, which is the point. POSTGRES_PASSWORD stays,
-        # because .env.example ships it EMPTY on purpose (it is a secret to be
-        # filled in at provisioning) and the compose file guards it with
+        # That second guarantee needs the warning check below to be real.
+        # `compose config` treats an undefined interpolation as a WARNING --
+        # "The \"DOMAIN\" variable is not set. Defaulting to a blank string." --
+        # and still EXITS 0. Measured: deleting DOMAIN= from .env.example
+        # printed that warning four times and exited 0. Only ONE variable in
+        # docker-compose.production.yml carries a `${VAR:?}` guard
+        # (POSTGRES_PASSWORD), so without this check an exit-status-only step
+        # could not catch an undocumented variable at all, and the claim above
+        # would be false. A blank hostname, port or path renders "successfully"
+        # here and reaches the server the same way.
+        #
+        # DOMAIN is deliberately NOT in `env:` -- it comes from the copied
+        # .env.example, which is the point. POSTGRES_PASSWORD stays, because
+        # .env.example ships it EMPTY on purpose (it is a secret filled in at
+        # provisioning) and the compose file guards it with
         # `${POSTGRES_PASSWORD:?...}`, which rejects empty as well as unset.
         env:
           POSTGRES_PASSWORD: ci-render-only
         run: |
           cp .env.example .env
-          docker compose -f docker-compose.production.yml config > /dev/null
+
+          # 2>&1 >/dev/null: send stderr to the capture, then discard the
+          # rendered YAML. `if !` rather than a bare call so a hard render
+          # error still prints compose's own diagnostic before failing.
+          if ! render_stderr=$(docker compose -f docker-compose.production.yml config 2>&1 >/dev/null); then
+            printf '%s\n' "${render_stderr}" >&2
+            echo "ERROR: docker-compose.production.yml does not render." >&2
+            exit 1
+          fi
+
+          # A here-string, NOT `printf ... | grep`. Under `set -o pipefail`
+          # (which Actions sets for every run: block) grep -q exits on its
+          # first match, printf takes SIGPIPE, and the pipeline reports 141 --
+          # so the check would silently never fire on the very input it exists
+          # to catch.
+          if grep -q 'variable is not set' <<< "${render_stderr}"; then
+            printf '%s\n' "${render_stderr}" >&2
+            echo "ERROR: the compose file interpolates a variable that .env.example" >&2
+            echo "       does not define. Compose defaults it to a blank string and" >&2
+            echo "       still exits 0, so this renders 'successfully' with an empty" >&2
+            echo "       hostname, port or path -- and the same blank would reach the" >&2
+            echo "       server, where it is a mid-deploy failure instead." >&2
+            echo "       Add the variable to .env.example, or give it a default in" >&2
+            echo "       docker-compose.production.yml." >&2
+            exit 1
+          fi
+
+          echo "compose renders, and .env.example defines every variable it interpolates"
 
   rollout-tests:
     name: Rollout Primitive Tests

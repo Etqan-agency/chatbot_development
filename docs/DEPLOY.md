@@ -232,9 +232,10 @@ IMAGE_TAG=<the currently deployed tag> docker compose -f docker-compose.producti
 ```
 
 (substitute `dashboard`/2 or the affected service and its steady count). The
-scripts fill in the tag for you — `assert_steady_replicas` and
-`reconcile_service` read `CURRENT` from `.release-state` and print it inline,
-so the line in the error message is copy-pasteable as printed. If it prints
+scripts fill in the tag for you — `assert_steady_replicas` when it refuses,
+and `reconcile_service` when its own scale fails to take, read `CURRENT` from
+`.release-state` and print it inline, so the line in the error message is
+copy-pasteable as printed. If it prints
 the placeholder instead, `.release-state` could not be read; get the tag with
 `cat .release-state` or `docker inspect` on a surviving replica.
 
