@@ -10,3 +10,6 @@
 .vscode/
 .idea/
 .DS_Store
+
+# Written on the server by deploy.sh; never committed.
+.release-state

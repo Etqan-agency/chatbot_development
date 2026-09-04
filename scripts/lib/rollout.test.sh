@@ -333,6 +333,99 @@ check "reconcile then roll succeeds from a doubled pre-state" "0" "$?"
 check "reconcile+roll converges to steady" "2" "$(grep -c . "$STUB_DIR/ps")"
 
 # ---------------------------------------------------------------------------
+# End-to-end: deploy.sh and rollback.sh against the same stubbed docker.
+#
+# The unit tests above prove the primitives. These prove the two call sites use
+# them, which is the whole of RESIDUAL 1 and RESIDUAL 2: where the check runs
+# matters as much as what it checks.
+# ---------------------------------------------------------------------------
+PROJ="$STUB_DIR/proj"
+
+# `free` and `curl` are the only other host commands the scripts shell out to.
+cat > "$STUB_DIR/free" <<'STUB'
+#!/usr/bin/env bash
+echo "Mem: 1 2 3 4 5 4000"
+STUB
+cat > "$STUB_DIR/curl" <<'STUB'
+#!/usr/bin/env bash
+echo 200
+STUB
+chmod +x "$STUB_DIR/free" "$STUB_DIR/curl"
+
+setup_proj() { # a throwaway deploy directory holding a copy of scripts/
+  rm -rf "$PROJ"
+  mkdir -p "$PROJ/media" "$PROJ/traefik"
+  cp -R .. "$PROJ/scripts"
+  : > "$PROJ/docker-compose.production.yml"
+  : > "$PROJ/media/nginx.conf"
+  : > "$PROJ/traefik/traefik.yml"
+  printf 'DOMAIN=example.test\n' > "$PROJ/.env"
+}
+
+# --- RESIDUAL 1: the preflight must catch a NON-web service, before any
+#     mutation. Before this, the run reached `roll_service dashboard` only after
+#     the backup, collectstatic, migrate, the worker roll and the web roll.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-dashboard-3 \
+  chatbot-worker-1
+err=$(bash "$PROJ/scripts/deploy.sh" testtag 2>&1 >/dev/null); rc=$?
+check "deploy.sh aborts when dashboard is at the wrong replica count" "1" "$rc"
+check "the abort names dashboard and its actual count" "1" \
+  "$(grep -c 'dashboard has 3 running replicas, expected 2' <<<"$err" || true)"
+check "the abort prints the reconcile command" "1" \
+  "$(grep -cF -- '--scale dashboard=2 dashboard' <<<"$err" || true)"
+check "deploy.sh aborted BEFORE pulling images" "0" \
+  "$(grep -c '^compose -f .* pull' "$STUB_DIR/calls.log" || true)"
+check "deploy.sh aborted BEFORE migrate" "0" \
+  "$(grep -c 'migrate' "$STUB_DIR/calls.log" || true)"
+check "deploy.sh aborted BEFORE the backup" "0" \
+  "$(grep -c 'backup' "$STUB_DIR/calls.log" || true)"
+check "deploy.sh aborted BEFORE rolling web" "0" \
+  "$(grep -cF -- '--scale web=4 web' "$STUB_DIR/calls.log" || true)"
+check "deploy.sh stopped no container" "0" \
+  "$(grep -c '^stop ' "$STUB_DIR/calls.log" || true)"
+check "dashboard is untouched at 3 replicas" "3" \
+  "$(grep -c '^chatbot-dashboard-' "$STUB_DIR/ps")"
+
+# --- RESIDUAL 2: rollback.sh must PROCEED from the dirty state a deploy refuses.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-web-3 chatbot-web-4 \
+  chatbot-dashboard-1 chatbot-dashboard-2 \
+  chatbot-worker-1
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+out=$(bash "$PROJ/scripts/rollback.sh" oldtag 2>&1); rc=$?
+check "rollback.sh succeeds from a doubled web pre-state" "0" "$rc"
+check "rollback.sh logged what it found" "1" \
+  "$(grep -c 'RECONCILE web: found 4 replicas, expected 2' <<<"$out" || true)"
+check "rollback.sh logged what it did" "1" \
+  "$(grep -c 'reconcile web: 4 -> 2 replicas' <<<"$out" || true)"
+check "rollback.sh said nothing to do for the clean service" "1" \
+  "$(grep -cE 'reconcile dashboard: already at 2 replicas' <<<"$out" || true)"
+check "rollback.sh reconciled BEFORE rolling web" "reconcile" \
+  "$(grep -oE -- '--no-recreate --scale web=(2|4)' "$STUB_DIR/calls.log" \
+     | head -1 | sed 's/.*web=2/reconcile/;s/.*web=4/roll/')"
+check "rollback.sh still rolled web to the target tag" "1" \
+  "$(grep -cF -- '--scale web=4 web' "$STUB_DIR/calls.log" || true)"
+check "web converged to 2 replicas" "2" \
+  "$(grep -c '^chatbot-web-' "$STUB_DIR/ps")"
+check "dashboard converged to 2 replicas" "2" \
+  "$(grep -c '^chatbot-dashboard-' "$STUB_DIR/ps")"
+check "rollback.sh recorded the target as CURRENT" "CURRENT=oldtag" \
+  "$(grep '^CURRENT=' "$PROJ/.release-state" || true)"
+
+# The repair is opt-in: a deploy from the same dirty state must still refuse.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-web-3 chatbot-web-4 \
+  chatbot-dashboard-1 chatbot-dashboard-2
+bash "$PROJ/scripts/deploy.sh" testtag >/dev/null 2>&1
+check "deploy.sh does NOT reconcile the state rollback.sh repairs" "1" "$?"
+check "deploy.sh scaled nothing" "0" \
+  "$(grep -c -- '--scale' "$STUB_DIR/calls.log" || true)"
+
+# ---------------------------------------------------------------------------
 # service_labels_match: the guard for Traefik's "one service, one definition"
 # rule. Traefik discards a service outright when its containers disagree, so a
 # roll that creates a container with different service labels 404s the host for
