@@ -332,5 +332,65 @@ reconcile_service frontend 2 >/dev/null 2>&1 && roll_service frontend 2 30 false
 check "reconcile then roll succeeds from a doubled pre-state" "0" "$?"
 check "reconcile+roll converges to steady" "2" "$(grep -c . "$STUB_DIR/ps")"
 
+# ---------------------------------------------------------------------------
+# service_labels_match: the guard for Traefik's "one service, one definition"
+# rule. Traefik discards a service outright when its containers disagree, so a
+# roll that creates a container with different service labels 404s the host for
+# the whole rollout. Detecting drift BEFORE creating anything is the only gate
+# that can prevent it -- by the time a health check runs, the damage is done.
+# ---------------------------------------------------------------------------
+
+stage_labels() { # stage_labels <compose-json> <container>=<labels>...
+  : > "$STUB_DIR/labels"
+  printf '%s' "$1" > "$STUB_DIR/compose_json"; shift
+  for pair in "$@"; do
+    c="${pair%%=*}"
+    # every line must carry the container prefix; the stub looks up by line
+    printf '%s\n' "${pair#*=}" | while IFS= read -r l; do
+      [ -n "$l" ] && printf '%s %s\n' "$c" "$l" >> "$STUB_DIR/labels"
+    done
+  done
+}
+
+DESIRED_JSON='{"services":{"web":{"labels":["traefik.enable=true","traefik.http.services.web.loadbalancer.server.port=5000","traefik.http.services.web.loadbalancer.healthcheck.status=200"]}}}'
+MATCHING='traefik.http.services.web.loadbalancer.server.port=5000
+traefik.http.services.web.loadbalancer.healthcheck.status=200'
+DRIFTED='traefik.http.services.web.loadbalancer.server.port=5000'
+
+write_docker_stub
+printf 'chatbot-web-1\nchatbot-web-2\n' > "$STUB_DIR/ps"
+
+stage_labels "$DESIRED_JSON" "chatbot-web-1=$MATCHING" "chatbot-web-2=$MATCHING"
+service_labels_match web >/dev/null 2>&1
+check "identical labels on every replica match" "0" "$?"
+
+stage_labels "$DESIRED_JSON" "chatbot-web-1=$DRIFTED" "chatbot-web-2=$DRIFTED"
+service_labels_match web >/dev/null 2>&1
+check "a label missing on ALL replicas is drift" "1" "$?"
+
+stage_labels "$DESIRED_JSON" "chatbot-web-1=$MATCHING" "chatbot-web-2=$DRIFTED"
+service_labels_match web >/dev/null 2>&1
+check "a label missing on ONE replica is drift" "1" "$?"
+
+stage_labels "$DESIRED_JSON" "chatbot-web-1=$DRIFTED" "chatbot-web-2=$DRIFTED"
+out=$(service_labels_match web 2>&1)
+case "$out" in
+  *healthcheck.status=200*) got=named ;;
+  *) got="$out" ;;
+esac
+check "drift message names the differing label" "named" "$got"
+
+# assert_service_labels: the preflight wrapper over every rolled service
+stage_labels "$DESIRED_JSON" "chatbot-web-1=$MATCHING" "chatbot-web-2=$MATCHING"
+assert_service_labels web >/dev/null 2>&1
+check "assert passes when labels match" "0" "$?"
+
+stage_labels "$DESIRED_JSON" "chatbot-web-1=$DRIFTED" "chatbot-web-2=$DRIFTED"
+: > "$STUB_DIR/calls.log"
+assert_service_labels web >/dev/null 2>&1
+check "assert fails on drift" "1" "$?"
+mutating=$(grep -cE "compose .* (up|stop|rm) |^stop |^rm " "$STUB_DIR/calls.log" 2>/dev/null || true)
+check "assert mutates nothing when it refuses" "0" "$mutating"
+
 echo "---"; echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
