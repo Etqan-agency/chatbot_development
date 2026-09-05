@@ -183,34 +183,75 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
      **refuses to start at all** on the next `systemctl restart` (a reboot, an
      apt upgrade), taking `:80` and `:443` down for *every* site on this host.
      certbot cannot rescue it either — it runs `nginx -t` itself first.
-   - Obtain the certificates:
+   - **Obtain the certificates with `certonly --webroot`, not `--nginx`:**
      ```bash
-     sudo certbot --nginx \
-       -d api-demo-chatbot.abdulkhalek.dev \
+     sudo certbot certonly --webroot -w /var/www/html \
+       -d api-demo-chatbot.abdulkhalek.dev
+     sudo certbot certonly --webroot -w /var/www/html \
        -d app-demo-chatbot.abdulkhalek.dev
      ```
-     certbot **creates** the `:443 ssl` server block in each vhost, fills in
-     the `ssl_certificate`/`ssl_certificate_key` lines, and rewrites the `:80`
-     `location /` to redirect. Renewal is certbot's own systemd timer
-     (`certbot.timer`) — there is no Traefik involvement in issuance or
-     renewal.
+     **Do not use `certbot --nginx` here.** The nginx plugin does not create a
+     second server block: with only a `:80` server present it *appends*
+     `listen 443 ssl` and the certificate lines to that same block. The `:80`
+     `location /` redirect then applies to https as well, and every https
+     request 301s to itself — an infinite redirect loop on both hostnames.
+     That is measured behaviour on this stack, not a theoretical risk.
 
-     The `:80` block keeps its `location /.well-known/acme-challenge/` for
-     renewals. Note that the redirect is written as `location / { return 301
-     ... }` rather than a server-level `return 301`: a server-level return runs
-     in nginx's rewrite phase, *before* location matching, and would swallow
-     the challenge — every renewal would then fail.
-   - **Add the proxy settings to the `:443` block certbot just created.** Each
-     vhost carries them as a commented `REFERENCE` block at the bottom of the
-     file; copy that block's contents into the generated `server { listen 443
-     ssl; ... }` and uncomment. This is `client_max_body_size 25M`, the two
-     `120s` proxy timeouts and the whole `location /` `proxy_pass` to
-     `127.0.0.1:8081`. certbot generates none of them, and without them the
-     vhost terminates TLS and then serves nothing. Then:
+     `certonly --webroot` writes no nginx configuration at all. It answers the
+     HTTP-01 challenge through the `location /.well-known/acme-challenge/`
+     already in the `:80` block, which is also what keeps renewals working:
+     certbot's systemd timer (`certbot.timer`) reuses the webroot authenticator
+     recorded in `/etc/letsencrypt/renewal/<host>.conf`. There is no Traefik
+     involvement in issuance or renewal.
+
+     Note the redirect is written as `location / { return 301 ... }` rather
+     than a server-level `return 301`: a server-level return runs in nginx's
+     rewrite phase, *before* location matching, and would swallow the challenge
+     — every renewal would then fail.
+   - **Uncomment the `:443` block in each vhost.** Both files ship it commented
+     out below the `:80` server. It carries `client_max_body_size 25M`, the two
+     `120s` proxy timeouts, the `ssl_certificate` lines and the `location /`
+     `proxy_pass` to `127.0.0.1:8081` — none of which exist until you uncomment
+     them, and without which the vhost terminates TLS and then serves nothing.
+
+     It uses `listen 443 ssl http2`, not the standalone `http2 on;` directive:
+     that form requires nginx >= 1.25, and on 1.24 nginx rejects the entire
+     configuration with `unknown directive "http2"`.
 
      ```bash
      sudo nginx -t && sudo systemctl reload nginx
      ```
+     Verify before moving on — the loop above is invisible to `nginx -t`:
+     ```bash
+     curl -sS -o /dev/null -L --max-redirs 3 \
+       -w 'code=%{http_code} redirects=%{num_redirects}\n' \
+       https://api-demo-chatbot.abdulkhalek.dev/
+     ```
+     Expect `redirects=0`. A `curl: (47) Maximum (3) redirects followed` means
+     the `:80` and `:443` blocks have been merged into one server.
+
+   - **Do not add IPv6 listeners without checking every other vhost on the
+     host.** nginx makes the *first* server block on an `address:port` the
+     default server for that address, and `sites-enabled/` is read
+     alphabetically. Adding `listen [::]:80` to a vhost whose name sorts early,
+     on a host where the other sites' vhosts are IPv4-only, silently makes it
+     the default server for **all** IPv6 traffic — including ACME challenges
+     for those other sites, which then 404. Let's Encrypt does not retry over
+     IPv4 after a 404 (it is a valid HTTP response), so the co-hosted site's
+     certificate stops renewing and nothing reports it until expiry. That
+     happened during this host's provisioning and broke `etqanbackend.tech`'s
+     renewal; `nginx -t` is blind to it. The shipped vhosts are IPv4-only
+     because these hostnames have no AAAA records. If they gain them, add the
+     IPv6 listener to *every* vhost on the host at once.
+   - **Prove renewal works before walking away** — for every certificate on the
+     host, not just the new ones:
+     ```bash
+     sudo certbot renew --dry-run
+     ```
+     Expect `Congratulations, all simulated renewals succeeded` and one
+     `(success)` line per certificate. This is the only check that exercises
+     the challenge path end to end, and a renewal that fails here fails
+     silently in 60 days.
 
 8. **Bring the stack up once by hand, before any CD run:**
    ```bash
