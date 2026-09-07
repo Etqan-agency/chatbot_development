@@ -358,10 +358,14 @@ take that hit is an operator's decision, not a rolling deploy's to make
 silently.
 
 The mtime comparison only means anything because `cd.yml` syncs `traefik/` with
-`rsync --checksum`. A fresh checkout gives every file the runner's current
-timestamp, so without it rsync would retransmit `traefik.yml` on every run and
-stamp a new mtime on the server even when nothing changed — and this check
-would refuse every deploy instead of only the ones that actually changed it.
+**both** `--checksum` and `--no-times`, and both are load-bearing. `--checksum`
+stops rsync retransmitting a file that a fresh checkout merely re-timestamped.
+`--no-times` stops it copying the source mtime across anyway — `-a` implies
+`-t`, which syncs timestamps even for files `--checksum` decided not to
+transfer. That second one is easy to miss: with `--checksum` alone, an unchanged
+`traefik.yml` still had its server-side mtime advanced on every run, and this
+check refused a deploy it should have passed. Get either flag wrong and it cries
+wolf on every deploy.
 
 **`deploy.sh` auto-rolls-back only when the smoke checks fail.** Concretely:
 a failure during preflight, `migrate`, or a `roll_service`/`roll_worker` call

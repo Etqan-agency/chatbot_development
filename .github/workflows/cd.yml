@@ -174,16 +174,27 @@ jobs:
           # traefik_acme and traefik_logs volumes, not under traefik/, so
           # nothing server-generated lives in the synced tree.
           #
-          # --checksum: compare by content, not size+mtime. A fresh checkout
-          # gives every file the runner's current timestamp, so without this
-          # rsync retransmits traefik.yml on EVERY run and stamps a new mtime
-          # on the server even when nothing changed. deploy.sh's
-          # assert_gateway_config_applied compares that mtime against the
-          # Traefik container's start time to catch static config that was
-          # synced but never loaded -- and with mtime churning every run, that
-          # check would refuse every deploy instead of only the ones that
-          # actually changed the file.
-          rsync -avz --checksum --delete -e "${SSH_CMD}" traefik/ \
+          # --checksum AND --no-times, and BOTH are required.
+          #
+          # deploy.sh's assert_gateway_config_applied compares traefik.yml's
+          # mtime on the server against the Traefik container's start time, to
+          # catch static config that was synced but never loaded. That signal is
+          # only worth anything if the mtime means "when the content last
+          # changed" rather than "when the last deploy ran".
+          #
+          # --checksum stops rsync deciding to retransmit: a fresh checkout
+          # stamps every file with the runner's current time, so the default
+          # size+mtime quick check sees a difference on every single run.
+          #
+          # --no-times is what actually holds the timestamp still, and it is the
+          # part that is easy to get wrong. `-a` implies `-t`, and `-t` syncs
+          # the source mtime onto the destination even for files --checksum
+          # decided NOT to transfer. Measured: with --checksum alone, an
+          # unchanged traefik.yml still had its server-side mtime advanced to
+          # the run's start, and the guard refused a deploy it should have
+          # passed. With --no-times, an unchanged file is left completely alone
+          # and a changed one gets the time it was actually written.
+          rsync -avz --checksum --no-times --delete -e "${SSH_CMD}" traefik/ \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/traefik/"
           rsync -avz --delete -e "${SSH_CMD}" scripts/ \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/scripts/"

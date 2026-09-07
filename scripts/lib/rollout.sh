@@ -170,10 +170,13 @@ assert_loopback_publication() {
 # check that covers every static change.
 #
 # mtime vs StartedAt is the signal, and it only means anything because cd.yml
-# syncs traefik/ with --checksum. Without it rsync retransmits on every run --
-# a fresh checkout has fresh mtimes -- so the file would always look newer than
-# the container and this would refuse every deploy, which is worse than not
-# checking at all.
+# syncs traefik/ with BOTH --checksum and --no-times. --checksum stops rsync
+# retransmitting a file a fresh checkout merely re-timestamped; --no-times stops
+# it copying the source mtime across anyway, which `-a` (which implies `-t`)
+# otherwise does even for files --checksum skipped. Measured: with --checksum
+# alone the server-side mtime still advanced on every run and this refused a
+# deploy it should have passed. Get either flag wrong and the check cries wolf
+# on every deploy, which is worse than not checking at all.
 #
 # Deliberately NOT fixed automatically: recreating Traefik drops every
 # in-flight connection, which is the exact property the rest of this file
