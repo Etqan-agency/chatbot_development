@@ -210,9 +210,23 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
      — every renewal would then fail.
    - **Uncomment the `:443` block in each vhost.** Both files ship it commented
      out below the `:80` server. It carries `client_max_body_size 25M`, the two
-     `120s` proxy timeouts, the `ssl_certificate` lines and the `location /`
-     `proxy_pass` to `127.0.0.1:8081` — none of which exist until you uncomment
-     them, and without which the vhost terminates TLS and then serves nothing.
+     `120s` proxy timeouts, the `ssl_certificate` lines, the TLS settings and
+     the `location /` `proxy_pass` to `127.0.0.1:8081` — none of which exist
+     until you uncomment them, and without which the vhost terminates TLS and
+     then serves nothing.
+
+     The TLS settings are written out **inline** rather than pulled in with
+     `include /etc/letsencrypt/options-ssl-nginx.conf` and `ssl_dhparam
+     /etc/letsencrypt/ssl-dhparams.pem`, which is what these files used to do.
+     Both of those are written into `/etc/letsencrypt` by certbot's *nginx
+     installer* plugin, and `certonly --webroot` runs no installer — that is
+     the entire reason the previous step uses it. On a host that has never run
+     `certbot --nginx` neither file exists, and `include`ing a missing file is
+     a hard `nginx -t` failure at this exact step. If you are adopting an
+     existing host, confirm before assuming either way:
+     ```bash
+     ls -l /etc/letsencrypt/options-ssl-nginx.conf /etc/letsencrypt/ssl-dhparams.pem
+     ```
 
      It uses `listen 443 ssl http2`, not the standalone `http2 on;` directive:
      that form requires nginx >= 1.25, and on 1.24 nginx rejects the entire
@@ -303,7 +317,8 @@ triggers `.github/workflows/cd.yml` on `push`:
    ```bash
    bash scripts/deploy.sh <tag> [--skip-backup] [--dry-run]
    ```
-   `deploy.sh` runs, **in order**: preflight (disk/memory, Traefik API
+   `deploy.sh` runs, **in order**: preflight (disk/memory, gateway published on
+   loopback, gateway running its current *static* config, Traefik API
    reachable, every rolled service at its steady replica count, no
    `traefik.http.services.*` label drift) → image pull → data tier `up -d
    --no-recreate` (never recreates `db`/`redis`) → a Postgres backup (unless
@@ -312,6 +327,41 @@ triggers `.github/workflows/cd.yml` on `push`:
    smoke checks.
 4. Read the **Deployment summary** in the run's Job Summary: a table of both
    URLs and the image tag that is now `CURRENT`.
+
+### Changing `traefik/traefik.yml` needs an explicit gateway restart
+
+`traefik.yml` is **static** configuration: Traefik reads it once, at process
+start. Only `traefik/dynamic/` hot-reloads. `cd.yml` rsyncs `traefik/` to the
+server, but nothing in a deploy recreates the Traefik container — it touches
+`db`, `redis`, `socket-proxy` and `media`, and rolls `worker`, `web` and
+`dashboard`. A changed `traefik.yml` therefore lands on disk, is never read,
+and the deploy reports success while the configuration in Git and the one
+actually serving traffic disagree — silently, and indefinitely.
+
+That is not hypothetical: the `providers.docker` constraint that stops Traefik
+discovering a co-tenant project's containers arrived exactly this way, correct
+in Git and inert in production.
+
+So `deploy.sh`'s preflight compares `traefik/traefik.yml`'s mtime against the
+Traefik container's start time and **refuses** when the file is newer:
+
+```
+ERROR: traefik/traefik.yml is newer than the running chatbot-traefik-1.
+       Traefik reads that file ONCE, at process start; it does not
+       hot-reload, unlike traefik/dynamic/. ...
+         docker compose -f docker-compose.production.yml up -d --no-deps --force-recreate traefik
+```
+
+Run that one command on the server, then re-run the deploy. It is **not** done
+automatically: recreating Traefik drops every in-flight connection, and when to
+take that hit is an operator's decision, not a rolling deploy's to make
+silently.
+
+The mtime comparison only means anything because `cd.yml` syncs `traefik/` with
+`rsync --checksum`. A fresh checkout gives every file the runner's current
+timestamp, so without it rsync would retransmit `traefik.yml` on every run and
+stamp a new mtime on the server even when nothing changed — and this check
+would refuse every deploy instead of only the ones that actually changed it.
 
 **`deploy.sh` auto-rolls-back only when the smoke checks fail.** Concretely:
 a failure during preflight, `migrate`, or a `roll_service`/`roll_worker` call
@@ -404,6 +454,25 @@ generally reversible).
 `rollback.sh` also **reconciles** replica counts before rolling (see §6): it
 will bring a service that is stuck at double replicas back to steady first,
 rather than refusing like a deploy does. That's deliberate — see §6 for why.
+
+### A rollback does not require the registry
+
+`rollback.sh` pulls the target images first, but a **failed pull no longer
+aborts it**. Under `set -e` a bare `docker compose pull` used to end the script
+there — so a ghcr.io outage, an expired `GHCR_PAT`, or a DNS failure on the
+host removed the recovery path at exactly the moment it was needed, and did so
+for a step that is usually unnecessary: rolling *back* means returning to a
+release that was recently running on this host, whose images are therefore
+already in the local image store. The registry is an optimisation here, not a
+dependency.
+
+So the pull is attempted; if it fails, every image the compose file names for
+`web`, `worker` and `dashboard` must be present locally and the rollback
+continues with a warning. It refuses only when one is genuinely missing — and
+names it, because "obtain that image some other way" is then the operator's
+next move. The warning matters: it means the tag was **not** re-verified
+against the registry, so a locally-tagged image that does not match what the
+registry holds under that tag would be used without complaint.
 
 ## 6. When a rollout is interrupted
 

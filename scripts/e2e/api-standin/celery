@@ -1,0 +1,17 @@
+#!/bin/sh
+# Stand-in for the celery CLI, covering the two invocations the compose file
+# makes of it: the worker command itself, and the healthcheck's `inspect ping`.
+#
+# The SIGTERM trap is the point of this file. services.sh gives `worker` a 360s
+# stop timeout because Celery treats SIGTERM as a warm shutdown, and
+# `docker stop -t 360` waits the full 360s for a process that ignores it. A
+# stand-in without this trap would add six minutes to every roll and make the
+# rehearsal useless in CI -- while looking like a hang, not a bug.
+case "$*" in
+  *"inspect ping"*) echo "-> celery@$(hostname): OK"; exit 0 ;;
+esac
+echo "worker stand-in ${RELEASE:-unknown} ready" >&2
+trap 'echo "warm shutdown" >&2; exit 0' TERM INT
+# `wait` so the trap can run: a bare `sleep` would not be interrupted until it
+# returned, which is the behaviour this trap exists to avoid.
+while :; do sleep 1 & wait $!; done

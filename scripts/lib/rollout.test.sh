@@ -37,10 +37,19 @@ case "$1" in
   ps)
     cat "$STUB_DIR/ps" 2>/dev/null
     ;;
+  image)
+    # `docker image inspect <ref>`: present iff the test staged it.
+    if [ "${2:-}" = inspect ]; then
+      grep -qxF "${*: -1}" "$STUB_DIR/local_images" 2>/dev/null; exit $?
+    fi
+    ;;
   inspect)
     c="${*: -1}"
     # A Labels-format inspect asks for container labels, not health.
     case "$*" in
+      *State.StartedAt*)
+        cat "$STUB_DIR/started_at" 2>/dev/null
+        exit 0 ;;
       *Config.Labels*)
         grep "^${c} " "$STUB_DIR/labels" 2>/dev/null | cut -d' ' -f2-
         exit 0 ;;
@@ -76,6 +85,14 @@ case "$1" in
     # `config --format json` returns whatever the test staged as desired state.
     case "$*" in
       *"config --format json"*) cat "$STUB_DIR/compose_json" 2>/dev/null; exit 0 ;;
+      # `compose exec -T db bash -c "...pg_dump..."`. The stub cannot run the
+      # pipeline, so it returns the status deploy.sh must BRANCH on; whether
+      # the real pipeline reports that status truthfully is what the separate
+      # `set -o pipefail` assertion below covers.
+      *pg_dump*) exit "$(cat "$STUB_DIR/pg_dump_rc" 2>/dev/null || echo 0)" ;;
+      # `compose pull`: status controlled by the test, so the registry can be
+      # made unreachable without one existing.
+      *" pull "*|*" pull") exit "$(cat "$STUB_DIR/pull_rc" 2>/dev/null || echo 0)" ;;
     esac
     # Model `up -d --scale <svc>=<n>`: create containers until there are n.
     prev=""; spec=""
@@ -117,6 +134,13 @@ reset_stub() { # reset_stub <api-json> [ps-lines...]
   echo healthy > "$STUB_DIR/health_default"
   rm -f "$STUB_DIR/stop_noop"
   printf '80/tcp -> 127.0.0.1:8081\n' > "$STUB_DIR/port"
+  echo 0 > "$STUB_DIR/pg_dump_rc"
+  echo 0 > "$STUB_DIR/pull_rc"
+  # Far future by default, so the gateway looks freshly started and the
+  # static-config guard stays out of every other test's way.
+  echo "2099-01-01T00:00:00Z" > "$STUB_DIR/started_at"
+  printf '%s\n' ghcr.io/etqan-agency/chatbot/api:rbtag \
+                ghcr.io/etqan-agency/chatbot/dashboard:rbtag > "$STUB_DIR/local_images"
   : > "$STUB_DIR/up_creates"
   : > "$STUB_DIR/ps"
   [ "$#" -gt 0 ] && printf '%s\n' "$@" > "$STUB_DIR/ps"
@@ -136,6 +160,10 @@ source ./rollout.sh
 export DRAIN_SETTLE_SECS=0
 # Keep the suite fast: the production defaults are 180s/120s.
 export BACKEND_TIMEOUT_SECS=2
+# The stub's api.json is a fixed 4-UP fixture, so the post-roll settle wait can
+# never observe the pool shrinking to `steady` and would burn its whole timeout
+# on every roll_service call. Its semantics get a dedicated test below instead.
+export SETTLE_TIMEOUT_SECS=0
 
 # --- traefik_backends_up parses serverStatus ---
 make_docker_stub '{"serverStatus":{"http://172.19.0.7:5000":"UP","http://172.19.0.9:5000":"DOWN"}}'
@@ -715,6 +743,328 @@ check "the refusal ran NO compose command" "0" \
   "$(grep -c '^compose ' "$STUB_DIR/calls.log" || true)"
 check "the refusal touched no container at all" "0" \
   "$(grep -c . "$STUB_DIR/calls.log" || true)"
+
+# ---------------------------------------------------------------------------
+# A failed pg_dump must not be recorded as a successful backup.
+#
+# The old form was `sh -c "pg_dump ... | gzip > f" || echo WARNING`. A pipeline
+# takes its LAST command's status, and gzip succeeds on empty input -- so a
+# pg_dump that failed outright still exited 0 and left a valid, restorable-
+# looking 20-byte archive. The warning was unreachable, and the 14-file
+# retention sweep two lines down would then rotate a REAL backup out to make
+# room for the empty one.
+# ---------------------------------------------------------------------------
+
+# The premise, proved against this machine's shells rather than asserted: a
+# bare pipeline hides the failure, and `set -o pipefail` exposes it. If this
+# first check ever fails, the fix in deploy.sh is unnecessary; if the second
+# does, it is broken.
+sh -c 'false | gzip > /dev/null' 2>/dev/null
+check "a bare pipeline reports gzip's success, hiding a failed dump" "0" "$?"
+bash -c 'set -o pipefail; false | gzip > /dev/null' 2>/dev/null
+check "set -o pipefail surfaces the failed dump" "1" "$?"
+
+# deploy.sh must send that option, under a shell that HAS it. `sh` in the
+# postgres image is dash, which only gained pipefail in 0.5.12 -- on anything
+# older the option is itself an error and every backup would report failure.
+backup_cmd=$(grep -A2 'backup_file=' ../deploy.sh | grep -F 'pg_dump')
+check "the dump runs under bash, not sh" "1" \
+  "$(grep -c 'bash -c' <<<"$backup_cmd" || true)"
+check "the dump command sets pipefail" "1" \
+  "$(grep -c 'set -o pipefail' <<<"$backup_cmd" || true)"
+
+# ...and deploy.sh must actually branch on the status it now gets.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+echo 1 > "$STUB_DIR/pg_dump_rc"
+out=$(bash "$PROJ/scripts/deploy.sh" testtag 2>&1); rc=$?
+check "a failed backup is reported, not swallowed" "1" \
+  "$(grep -c 'WARNING: backup failed' <<<"$out" || true)"
+check "the partial archive is removed" "1" \
+  "$(grep -c 'rm -f .*/backups/.*\.sql\.gz' "$STUB_DIR/calls.log" || true)"
+check "a failed backup does not claim the backup was written" "0" \
+  "$(grep -c 'backup written to' <<<"$out" || true)"
+# Non-fatal by design, as it always was: a deploy must not be blocked by the
+# backup, only honest about it.
+check "a failed backup does not abort the deploy" "0" "$rc"
+
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+out=$(bash "$PROJ/scripts/deploy.sh" testtag 2>&1) || true
+check "a successful backup says so" "1" \
+  "$(grep -c 'backup written to' <<<"$out" || true)"
+check "a successful backup removes nothing" "0" \
+  "$(grep -c 'rm -f .*/backups/' "$STUB_DIR/calls.log" || true)"
+
+# ---------------------------------------------------------------------------
+# service_containers counts REPLICAS, never `compose run` one-offs.
+#
+# Compose names a one-off `chatbot-<service>-run-<hash>`, and deploy.sh runs
+# three against `web` (collectstatic, migrate, the media probe). Under the old
+# `^chatbot-web-` prefix match a one-off still running when a roll starts made
+# assert_steady_replicas report 3 and refuse, and made roll_service's
+# before/new set arithmetic wrong.
+# ---------------------------------------------------------------------------
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 chatbot-web-run-a1b2c3
+check "a compose one-off is not counted as a replica" "2" \
+  "$(service_replica_count web)"
+check "a compose one-off is not listed as a replica" "0" \
+  "$(service_containers web | grep -c -- '-run-' || true)"
+# The neighbouring service must still be matched exactly, not by prefix.
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 chatbot-worker-1
+check "replicas of the named service are still counted" "2" \
+  "$(service_replica_count web)"
+check "a different service is not counted" "1" "$(service_replica_count worker)"
+
+# The whole point: with a one-off running, the deploy preflight must still see
+# a clean steady state rather than refusing.
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 chatbot-web-run-a1b2c3 \
+  chatbot-dashboard-1 chatbot-dashboard-2
+assert_steady_replicas "web 2 40 true" "dashboard 2 30 false" >/dev/null 2>&1
+check "the preflight is not tripped by a running one-off" "0" "$?"
+
+# ---------------------------------------------------------------------------
+# envval strips only a MATCHED surrounding quote pair.
+#
+# It used to be `tr -d "\"'"`, which deletes every quote character anywhere in
+# the value -- so a password of a'b"c silently became abc and the caller
+# authenticated with a credential nobody had configured.
+# ---------------------------------------------------------------------------
+ENVDIR="$STUB_DIR/envval"; mkdir -p "$ENVDIR"
+cat > "$ENVDIR/.env" <<'ENVFILE'
+PLAIN=hello
+DQUOTED="hello world"
+SQUOTED='hello world'
+INNERQUOTE=ab'cd"ef
+URLISH=postgres://u:p@db:5432/name?sslmode=require
+EMPTY=
+ENVFILE
+# Subshell so services.sh's APP_SERVICES cannot leak into the suite's state.
+# The path is resolved before the cd, so the `source=` directive below has a
+# literal for shellcheck to follow -- `$OLDPWD/services.sh` does not.
+SERVICES_SH="$PWD/services.sh"
+envval_at() (
+  cd "$ENVDIR" || return 1
+  # shellcheck source=SCRIPTDIR/services.sh
+  . "$SERVICES_SH"
+  envval "$1"
+)
+check "an unquoted value is unchanged"      "hello"       "$(envval_at PLAIN)"
+check "a double-quoted value is unwrapped"  "hello world" "$(envval_at DQUOTED)"
+check "a single-quoted value is unwrapped"  "hello world" "$(envval_at SQUOTED)"
+check "an INNER quote survives"             "ab'cd\"ef"   "$(envval_at INNERQUOTE)"
+check "a value containing = is not split"   "postgres://u:p@db:5432/name?sslmode=require" \
+  "$(envval_at URLISH)"
+check "a missing key yields empty"          ""            "$(envval_at NOSUCHKEY)"
+check "an empty value yields empty"         ""            "$(envval_at EMPTY)"
+
+# ---------------------------------------------------------------------------
+# A rollback must survive an unreachable registry.
+#
+# `docker compose pull` under `set -e` used to end rollback.sh outright, so a
+# ghcr.io outage, an expired credential or a DNS failure removed the recovery
+# path at exactly the moment it was needed -- for a step that is usually
+# unnecessary, since rolling BACK targets a release that was recently running
+# on this host and whose images are therefore already in the local store.
+#
+# Both directions matter. Continuing when the images are present is the fix;
+# still refusing when they are NOT is what keeps it safe, because compose would
+# otherwise create containers that cannot start.
+# ---------------------------------------------------------------------------
+RB_JSON='{"services":{"web":{"image":"ghcr.io/etqan-agency/chatbot/api:rbtag"},"worker":{"image":"ghcr.io/etqan-agency/chatbot/api:rbtag"},"dashboard":{"image":"ghcr.io/etqan-agency/chatbot/dashboard:rbtag"}}}'
+
+# Baseline: a working registry still takes the ordinary path.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+printf '%s' "$RB_JSON" > "$STUB_DIR/compose_json"
+printf 'CURRENT=rbtag\nPREVIOUS=older\n' > "$PROJ/.release-state"
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+out=$(bash "$PROJ/scripts/rollback.sh" rbtag 2>&1); rc=$?
+check "a rollback with a reachable registry succeeds" "0" "$rc"
+check "it does not warn about the registry when the pull worked" "0" \
+  "$(grep -c 'could not pull' <<<"$out" || true)"
+
+# The registry is unreachable but both images are on the host: proceed, loudly.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+printf '%s' "$RB_JSON" > "$STUB_DIR/compose_json"
+printf 'CURRENT=rbtag\nPREVIOUS=older\n' > "$PROJ/.release-state"
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+echo 1 > "$STUB_DIR/pull_rc"
+out=$(bash "$PROJ/scripts/rollback.sh" rbtag 2>&1); rc=$?
+check "an unreachable registry does NOT abort the rollback" "0" "$rc"
+check "it says the pull failed" "1" "$(grep -c 'could not pull' <<<"$out" || true)"
+check "it says it is using the local images" "1" \
+  "$(grep -c 'images already on this host' <<<"$out" || true)"
+check "it still rolled web" "1" \
+  "$(grep -cF -- '--scale web=4 web' "$STUB_DIR/calls.log" || true)"
+check "it still reached its own verification" "1" \
+  "$(grep -c '>>> verifying' <<<"$out" || true)"
+
+# The registry is unreachable AND an image is missing locally: refuse, before
+# creating anything, and name the image that is missing.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+printf '%s' "$RB_JSON" > "$STUB_DIR/compose_json"
+printf 'CURRENT=rbtag\nPREVIOUS=older\n' > "$PROJ/.release-state"
+echo 1 > "$STUB_DIR/pull_rc"
+# Only the api image is present; the dashboard image is not.
+printf '%s\n' ghcr.io/etqan-agency/chatbot/api:rbtag > "$STUB_DIR/local_images"
+: > "$STUB_DIR/calls.log"
+err=$(bash "$PROJ/scripts/rollback.sh" rbtag 2>&1 >/dev/null); rc=$?
+check "a missing image with no registry refuses" "1" "$rc"
+check "the refusal names the missing image" "1" \
+  "$(grep -c 'MISSING: ghcr.io/etqan-agency/chatbot/dashboard:rbtag' <<<"$err" || true)"
+check "the refusal creates no container" "0" \
+  "$(grep -cF -- '--scale' "$STUB_DIR/calls.log" || true)"
+check "the refusal stops no container" "0" \
+  "$(grep -c '^stop ' "$STUB_DIR/calls.log" || true)"
+
+# ---------------------------------------------------------------------------
+# wait_backends_settled: EXACTLY `expected`, not "at least".
+#
+# The distinction is the whole point. wait_backends_up returns as soon as there
+# are enough NEW backends; this must not return while an OLD one is still in
+# the pool, because a request dispatched to a container whose IP has already
+# been removed from the bridge is silently dropped -- no RST -- and hangs until
+# the client times out. That is what made a good release fail its own smoke
+# check and auto-roll-back.
+# ---------------------------------------------------------------------------
+TWO_UP='{"serverStatus":{"http://a:5000":"UP","http://b:5000":"UP"}}'
+MIXED='{"serverStatus":{"http://a:5000":"UP","http://b:5000":"UP","http://c:5000":"DOWN"}}'
+
+make_docker_stub "$TWO_UP"
+SETTLE_TIMEOUT_SECS=0 wait_backends_settled web 2 >/dev/null 2>&1
+check "settled returns when the pool is exactly the expected size" "0" "$?"
+
+make_docker_stub "$FOUR_UP"
+SETTLE_TIMEOUT_SECS=0 wait_backends_settled web 2 >/dev/null 2>&1
+check "settled does NOT return while an old backend is still UP" "1" "$?"
+
+# The counterpart it must not be confused with: wait_backends_up is satisfied
+# by a pool that is too LARGE, which is exactly the state that hangs a probe.
+make_docker_stub "$FOUR_UP"
+wait_backends_up web 2 2 >/dev/null 2>&1
+check "wait_backends_up is satisfied by an oversized pool" "0" "$?"
+
+# A DOWN backend is not in the pool, so it must not count towards the total.
+make_docker_stub "$MIXED"
+SETTLE_TIMEOUT_SECS=0 wait_backends_settled web 2 >/dev/null 2>&1
+check "settled counts only UP backends" "0" "$?"
+
+# On timeout it WARNS and returns 1 -- roll_service ignores that status on
+# purpose, so this must never become a hard failure that aborts a completed
+# roll.
+make_docker_stub "$FOUR_UP"
+warn=$(SETTLE_TIMEOUT_SECS=0 wait_backends_settled web 2 2>&1 >/dev/null)
+check "the timeout explains itself" "1" \
+  "$(grep -c 'has not finished retiring the old generation' <<<"$warn" || true)"
+
+# ---------------------------------------------------------------------------
+# A running gateway must not predate its own static configuration.
+#
+# traefik.yml is STATIC config: Traefik reads it once at process start. Only
+# traefik/dynamic/ hot-reloads. cd.yml rsyncs traefik/ to the server, but
+# nothing in a deploy recreates the Traefik container -- so a changed
+# traefik.yml sits on disk, unread, while the deploy reports success and the
+# committed configuration and the running one quietly disagree.
+#
+# That is not hypothetical: the providers.docker constraint that stops Traefik
+# discovering a co-tenant project's containers landed exactly this way, and
+# would have been inert until someone happened to recreate the container.
+#
+# The signal is mtime vs the container's StartedAt. It only means anything
+# because cd.yml rsyncs traefik/ with --checksum: without it rsync retransmits
+# on every run (a fresh checkout has fresh mtimes), the file always looks newer
+# than the container, and the guard cries wolf on every deploy.
+# ---------------------------------------------------------------------------
+
+stage_gateway() { # stage_gateway <config-mtime> <container-started>
+  mkdir -p "$STUB_DIR/gw"
+  : > "$STUB_DIR/gw/traefik.yml"
+  touch -d "$1" "$STUB_DIR/gw/traefik.yml"
+  printf '%s\n' "$2" > "$STUB_DIR/started_at"
+}
+
+reset_stub "$FOUR_UP" chatbot-web-1
+
+stage_gateway "2026-01-01T00:00:00Z" "2026-06-01T00:00:00Z"
+assert_gateway_config_applied "$STUB_DIR/gw/traefik.yml" >/dev/null 2>&1
+check "a gateway started AFTER its config is accepted" "0" "$?"
+
+stage_gateway "2026-06-01T00:00:00Z" "2026-01-01T00:00:00Z"
+assert_gateway_config_applied "$STUB_DIR/gw/traefik.yml" >/dev/null 2>&1
+check "a gateway older than its static config is refused" "1" "$?"
+
+err=$(assert_gateway_config_applied "$STUB_DIR/gw/traefik.yml" 2>&1 >/dev/null)
+check "the refusal names the recreate command" "1" \
+  "$(grep -cF -- '--force-recreate traefik' <<<"$err" || true)"
+check "the refusal explains that static config does not hot-reload" "1" \
+  "$(grep -ci 'hot-reload\|does not reload' <<<"$err" || true)"
+
+# Equal timestamps are the boundary: a container started in the same second as
+# the file was written did read it. Refusing there would fail a legitimate
+# deploy on a coincidence.
+stage_gateway "2026-06-01T00:00:00Z" "2026-06-01T00:00:00Z"
+assert_gateway_config_applied "$STUB_DIR/gw/traefik.yml" >/dev/null 2>&1
+check "an equal timestamp is not treated as drift" "0" "$?"
+
+# Inability to check must not block a deploy. The gateway being absent is
+# already caught, loudly, by assert_loopback_publication just above it.
+stage_gateway "2026-06-01T00:00:00Z" ""
+: > "$STUB_DIR/started_at"
+assert_gateway_config_applied "$STUB_DIR/gw/traefik.yml" >/dev/null 2>&1
+check "an unreadable start time does not block the deploy" "0" "$?"
+
+stage_gateway "2026-01-01T00:00:00Z" "2026-06-01T00:00:00Z"
+assert_gateway_config_applied "$STUB_DIR/gw/does-not-exist.yml" >/dev/null 2>&1
+check "a missing config file is refused" "1" "$?"
+
+# deploy.sh must enforce it, and enforce it in the PREFLIGHT. A stale gateway
+# config discovered after the backup, collectstatic, migrate and the worker
+# roll would leave the operator with a half-applied deploy to reason about, on
+# top of a gateway that is not running the configuration they think it is.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+# The gateway started long before setup_proj wrote traefik/traefik.yml.
+printf '2020-01-01T00:00:00Z\n' > "$STUB_DIR/started_at"
+err=$(bash "$PROJ/scripts/deploy.sh" testtag 2>&1 >/dev/null); rc=$?
+check "deploy.sh refuses a gateway running stale static config" "1" "$rc"
+check "the refusal names traefik.yml" "1" \
+  "$(grep -c 'traefik/traefik.yml is newer' <<<"$err" || true)"
+check "the refusal prints the recreate command" "1" \
+  "$(grep -cF -- '--force-recreate traefik' <<<"$err" || true)"
+check "it refused BEFORE pulling images" "0" \
+  "$(grep -c '^compose -f .* pull' "$STUB_DIR/calls.log" || true)"
+check "it refused BEFORE the backup" "0" \
+  "$(grep -c 'pg_dump' "$STUB_DIR/calls.log" || true)"
+check "it refused BEFORE migrate" "0" \
+  "$(grep -c 'migrate' "$STUB_DIR/calls.log" || true)"
+check "it stopped no container" "0" \
+  "$(grep -c '^stop ' "$STUB_DIR/calls.log" || true)"
+
+# ...and a gateway newer than its config deploys normally, or the guard is a
+# tripwire nobody can deploy past.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+# The label fixtures are global and the tests above leave them mismatched, so
+# without this the deploy aborts at the service-label parity gate and this case
+# would pass or fail for a reason that has nothing to do with the gateway.
+stage_labels '{"services":{}}'
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+out=$(bash "$PROJ/scripts/deploy.sh" testtag --skip-backup 2>&1); rc=$?
+check "a current gateway config does not block the deploy" "0" "$rc"
+check "the preflight says so" "1" \
+  "$(grep -c 'running its current static configuration' <<<"$out" || true)"
 
 echo "---"; echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

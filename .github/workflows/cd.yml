@@ -173,7 +173,17 @@ jobs:
           # indefinitely. Safe: ACME state and access logs live in the
           # traefik_acme and traefik_logs volumes, not under traefik/, so
           # nothing server-generated lives in the synced tree.
-          rsync -avz --delete -e "${SSH_CMD}" traefik/ \
+          #
+          # --checksum: compare by content, not size+mtime. A fresh checkout
+          # gives every file the runner's current timestamp, so without this
+          # rsync retransmits traefik.yml on EVERY run and stamps a new mtime
+          # on the server even when nothing changed. deploy.sh's
+          # assert_gateway_config_applied compares that mtime against the
+          # Traefik container's start time to catch static config that was
+          # synced but never loaded -- and with mtime churning every run, that
+          # check would refuse every deploy instead of only the ones that
+          # actually changed the file.
+          rsync -avz --checksum --delete -e "${SSH_CMD}" traefik/ \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/traefik/"
           rsync -avz --delete -e "${SSH_CMD}" scripts/ \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/scripts/"

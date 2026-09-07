@@ -60,6 +60,12 @@ echo "available memory: ${avail_mb}MiB"
 assert_loopback_publication || exit 1
 echo "traefik published on loopback only"
 
+# Before the API check below, deliberately: a stale traefik.yml is a common
+# CAUSE of that check failing, and "your gateway is running last week's config"
+# is a far more useful thing to be told than "the API is unreachable".
+assert_gateway_config_applied traefik/traefik.yml || exit 1
+echo "traefik is running its current static configuration"
+
 # The rolling swap health-gates on Traefik's API. That API is enabled by a
 # traefik.yml change that does NOT hot-reload -- it needs a manual container
 # restart. Without this check the deploy would get all the way past migrate and
@@ -127,9 +133,34 @@ if [ "$SKIP_BACKUP" != true ]; then
   pg_user="$(envval POSTGRES_USER)"; pg_user="${pg_user:-chatbot}"
   pg_db="$(envval POSTGRES_DB)";     pg_db="${pg_db:-chatbot}"
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  docker compose -f "$COMPOSE_FILE" exec -T db \
-    sh -c "pg_dump -U '${pg_user}' -d '${pg_db}' | gzip > /backups/${pg_db}-${stamp}.sql.gz" \
-    </dev/null || echo "WARNING: backup failed"
+  #
+  # `set -o pipefail` is what makes the failure branch below reachable at all.
+  # Without it the pipeline's exit status is gzip's, and gzip succeeds on empty
+  # input -- so a pg_dump that fails outright still exits 0 and leaves a valid,
+  # restorable-looking 20-byte archive. The old `|| echo "WARNING: backup
+  # failed"` could therefore never fire, and the retention line underneath
+  # would rotate a REAL backup out to make room for the empty one. Two deploys
+  # against a broken dump and the newest genuine backup is gone.
+  #
+  # `bash -c`, not `sh -c`: `sh` in this image is dash, which only gained
+  # pipefail in 0.5.12 (2022). On anything older `set -o pipefail` is itself an
+  # error and EVERY backup would report failure -- the same silent-wrong-answer
+  # bug with the sign flipped. The image is built on postgres:16, which is
+  # Debian-based and ships bash, so bash is the one that is actually guaranteed.
+  #
+  # The partial archive is removed on failure: a truncated .sql.gz that lists
+  # fine in the retention loop is worse than no file, because it is what an
+  # operator reaches for during a restore.
+  backup_file="/backups/${pg_db}-${stamp}.sql.gz"
+  if docker compose -f "$COMPOSE_FILE" exec -T db \
+       bash -c "set -o pipefail; pg_dump -U '${pg_user}' -d '${pg_db}' | gzip > '${backup_file}'" \
+       </dev/null; then
+    echo "backup written to ${backup_file}"
+  else
+    echo "WARNING: backup failed; removing the partial archive ${backup_file}" >&2
+    docker compose -f "$COMPOSE_FILE" exec -T db \
+      bash -c "rm -f '${backup_file}'" </dev/null || true
+  fi
   # Keep the last 14. Deleting oldest-first by name works because the stamp is
   # ISO-8601 basic and therefore lexicographically ordered.
   docker compose -f "$COMPOSE_FILE" exec -T db \

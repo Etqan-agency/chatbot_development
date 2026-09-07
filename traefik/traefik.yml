@@ -105,9 +105,35 @@ providers:
     endpoint: "tcp://socket-proxy:2375"
     exposedByDefault: false
     network: chatbot_default
-    # Defence in depth behind the `-l traefik.enable=false` flag Plan 3 puts on
-    # one-off containers. A `docker compose run` container inherits its
-    # service's labels; without this it registers as an extra backend with
-    # nothing listening. Ordinary compose containers carry oneoff=False, so
-    # this matches them and excludes only one-offs.
-    constraints: "Label(`com.docker.compose.oneoff`,`False`)"
+    # TWO constraints, for two different failure modes.
+    #
+    # oneoff=False: defence in depth behind the `-l traefik.enable=false` flag
+    # deploy.sh puts on one-off containers. A `docker compose run` container
+    # inherits its service's labels; without this it registers as an extra
+    # backend with nothing listening. Ordinary compose containers carry
+    # oneoff=False, so this matches them and excludes only one-offs.
+    #
+    # project=chatbot: the socket proxy exposes the WHOLE daemon, so this
+    # provider sees every container on the host, not just this stack's.
+    # `exposedByDefault: false` is not enough -- it only ignores containers
+    # with no traefik labels. Another Traefik-labelled stack on the same host
+    # is discovered in full, and Traefik requires a router (or service) name to
+    # have ONE definition across every container declaring it: two stacks that
+    # both name a router `api` make Traefik DISCARD it, and the host 404s. The
+    # names in this file are the generic ones (`api`, `app`, `web`,
+    # `dashboard`), so the collision is likely rather than exotic.
+    #
+    # Measured, not theorised: a second compose project on this developer's
+    # machine declared `traefik.http.routers.api.rule` and
+    # `traefik.http.routers.app.rule`, and BOTH of this stack's routers
+    # vanished from `/api/http/routers` -- every request 404ing, with nothing
+    # in the logs naming a cause. That is the same mechanism
+    # assert_service_labels guards against WITHIN a rollout; this guards it
+    # ACROSS projects, which no deploy-time check can see.
+    #
+    # `chatbot` must stay in step with the `name:` pinned at the top of
+    # docker-compose.production.yml -- the label is what compose derives from
+    # it. A production host runs one stack and is unaffected either way; this
+    # is what makes the local rehearsal (scripts/e2e.sh) and any co-tenancy
+    # safe.
+    constraints: "Label(`com.docker.compose.oneoff`,`False`) && Label(`com.docker.compose.project`,`chatbot`)"

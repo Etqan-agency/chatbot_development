@@ -264,6 +264,43 @@ jobs:
         # Stubs `docker` on PATH; touches no daemon and no network.
         run: bash scripts/lib/rollout.test.sh
 
+  infra-e2e:
+    name: Deploy/Rollback Rehearsal
+    runs-on: ubuntu-latest
+    needs: [changes]
+    # Same gate as infra-lint and rollout-tests: this exercises the deploy
+    # scripts, the compose topology and the shipped vhosts, none of which an
+    # application-only change can affect.
+    if: needs.changes.outputs.infra == 'true'
+    # The rehearsal runs three rolls, each of which waits out a drain settle
+    # window and two health gates. 25 minutes is roughly 3x the observed run
+    # and exists to kill a hang, not to bound normal work -- a rollout that
+    # deadlocks would otherwise hold a runner for the full 6h default.
+    timeout-minutes: 25
+    steps:
+      # No `submodules: recursive` and no SUBMODULE_TOKEN. The rehearsal builds
+      # its own stand-in images (scripts/e2e/*-standin) and tags them as the
+      # real ones, so the compose file runs unmodified without either component
+      # repo being present. That is deliberate: an infra gate that needed the
+      # submodules would fail on a submodule outage, and would re-run whenever
+      # application code changed for reasons this job cannot detect.
+      - uses: actions/checkout@v4
+
+      - name: Run the deploy/rollback rehearsal
+        # --fast shortens the drain settle window to 7s. That is still longer
+        # than Traefik's 5s healthcheck interval, so a drained backend is
+        # genuinely observed leaving the pool; the assertions are unchanged.
+        run: bash scripts/e2e.sh --fast
+
+      - name: Gateway and deploy logs on failure
+        if: failure()
+        # The rehearsal tears itself down on exit, so anything not printed by
+        # then is gone. This is a last resort for a failure that happened
+        # before the script's own diagnostics ran.
+        run: |
+          docker ps -a || true
+          docker logs chatbot-e2e-edge 2>&1 | tail -50 || true
+
   build-api:
     name: Build and Push API Image
     runs-on: ubuntu-latest
@@ -367,7 +404,7 @@ jobs:
   ci-summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [build-api, build-dashboard, infra-lint, rollout-tests]
+    needs: [build-api, build-dashboard, infra-lint, rollout-tests, infra-e2e]
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Summarise
@@ -381,6 +418,7 @@ jobs:
             echo "| Dashboard | ${{ needs.build-dashboard.result }} |"
             echo "| Infra lint | ${{ needs.infra-lint.result }} |"
             echo "| Rollout tests | ${{ needs.rollout-tests.result }} |"
+            echo "| Deploy rehearsal | ${{ needs.infra-e2e.result }} |"
             echo ""
             echo "**Commit:** \`${{ github.sha }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -399,4 +437,8 @@ jobs:
           if [ "${{ needs.rollout-tests.result }}" != "success" ] && \
              [ "${{ needs.rollout-tests.result }}" != "skipped" ]; then
             echo "Rollout primitive tests failed"; exit 1
+          fi
+          if [ "${{ needs.infra-e2e.result }}" != "success" ] && \
+             [ "${{ needs.infra-e2e.result }}" != "skipped" ]; then
+            echo "Deploy/rollback rehearsal failed"; exit 1
           fi

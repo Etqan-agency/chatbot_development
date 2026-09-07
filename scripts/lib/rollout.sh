@@ -11,16 +11,37 @@ TRAEFIK_API="${TRAEFIK_API:-http://127.0.0.1:8080/api}"
 # Traefik's healthcheck interval is 5s; three intervals is the settle window
 # after which a drained backend is certainly out of rotation.
 DRAIN_SETTLE_SECS="${DRAIN_SETTLE_SECS:-15}"
-# The api image's HEALTHCHECK declares start_period 40s and interval 30s, so a
-# cold web container needs ~70s before its first passing probe is recorded.
+# The api image's HEALTHCHECK declares start_period 60s and interval 10s
+# (chatbot_api/Dockerfile), so a cold web container needs ~70s before its first
+# passing probe is recorded. Re-derive this from the Dockerfile, not from
+# memory: an earlier version of this comment said 40s/30s, which happens to sum
+# to the same 70s and so hid the drift.
 HEALTH_TIMEOUT_SECS="${HEALTH_TIMEOUT_SECS:-180}"
 # How long to wait for Traefik to register the new backends once they are
 # already healthy. Registration is event-driven, so this is generous.
 BACKEND_TIMEOUT_SECS="${BACKEND_TIMEOUT_SECS:-120}"
+# How long to wait for Traefik to RETIRE the old backends after a roll. Same
+# event stream, so the same order of magnitude; separate knob because exceeding
+# it is a warning rather than a failure (see wait_backends_settled).
+SETTLE_TIMEOUT_SECS="${SETTLE_TIMEOUT_SECS:-60}"
 
-# Names of the running containers of a compose service, sorted.
+# Names of the running REPLICAS of a compose service, sorted.
+#
+# The `-[0-9]+$` anchor is load-bearing, not tidiness. `docker compose run`
+# names its one-off containers `chatbot-<service>-run-<hash>`, and deploy.sh
+# runs three of them against `web` (collectstatic, migrate, the media probe).
+# A bare `^chatbot-web-` prefix match counts those as replicas. They are --rm
+# and sequential on the deploy path, so that path is safe today, but any
+# one-off still running when a roll starts -- a hung migrate, an operator in a
+# `manage.py shell` -- makes assert_steady_replicas report 3 and refuse, and
+# makes roll_service's before/new set arithmetic wrong in a way no later gate
+# sees. A replica is always `<service>-<n>`; nothing else is.
+#
+# LC_ALL=C so the ordering is byte order, not locale collation: `comm` in
+# roll_service and service_labels_match demands its two inputs be sorted the
+# same way, and one of those inputs is sorted by python.
 service_containers() {
-  docker ps --format '{{.Names}}' | grep "^chatbot-${1}-" | sort || true
+  docker ps --format '{{.Names}}' | grep -E "^chatbot-${1}-[0-9]+$" | LC_ALL=C sort || true
 }
 
 # Count the non-empty lines of a newline-separated container list. `grep -c .`
@@ -131,6 +152,73 @@ assert_loopback_publication() {
   return 0
 }
 
+# Refuse when the running gateway predates its own static configuration.
+#
+# traefik.yml is STATIC: Traefik reads it once at process start. Only
+# traefik/dynamic/ hot-reloads (providers.file, watch: true). cd.yml rsyncs
+# traefik/ to the server, but NOTHING in a deploy recreates the Traefik
+# container -- it touches db, redis, socket-proxy and media, and rolls worker,
+# web and dashboard. So a changed traefik.yml lands on disk, is never read, and
+# the deploy reports success while the committed configuration and the one
+# actually serving traffic disagree -- silently, and for as long as nobody
+# recreates the container by hand.
+#
+# That is not hypothetical. deploy.sh's own preflight documents the trap for
+# the API setting, and the providers.docker constraint that stops Traefik
+# discovering a co-tenant project's containers arrived exactly this way: correct
+# in Git, inert in production. This generalises that one-off warning into a
+# check that covers every static change.
+#
+# mtime vs StartedAt is the signal, and it only means anything because cd.yml
+# syncs traefik/ with --checksum. Without it rsync retransmits on every run --
+# a fresh checkout has fresh mtimes -- so the file would always look newer than
+# the container and this would refuse every deploy, which is worse than not
+# checking at all.
+#
+# Deliberately NOT fixed automatically: recreating Traefik drops every
+# in-flight connection, which is the exact property the rest of this file
+# exists to preserve. Applying static config is an operator's decision about
+# when to take that hit, not a rollout's to make silently.
+assert_gateway_config_applied() {
+  local config="${1:-traefik/traefik.yml}"
+  local started started_epoch file_mtime
+
+  if [ ! -f "$config" ]; then
+    echo "ERROR: ${config} does not exist, so whether the running gateway" >&2
+    echo "       matches it cannot be determined." >&2
+    return 1
+  fi
+
+  started=$(docker inspect -f '{{.State.StartedAt}}' "$TRAEFIK_CONTAINER" 2>/dev/null)
+  started_epoch=$(date -d "$started" +%s 2>/dev/null)
+  if [ -z "$started_epoch" ]; then
+    # Do not block a deploy on an inability to check. A gateway that is absent
+    # or unreadable is already refused, loudly, by assert_loopback_publication.
+    echo "WARNING: could not read ${TRAEFIK_CONTAINER}'s start time; skipping the" >&2
+    echo "         static-configuration check." >&2
+    return 0
+  fi
+
+  file_mtime=$(stat -c %Y "$config" 2>/dev/null) || return 0
+
+  # Strictly greater: a container started in the same second the file was
+  # written did read it, and refusing on that coincidence would fail a
+  # legitimate deploy.
+  if [ "$file_mtime" -gt "$started_epoch" ]; then
+    echo "ERROR: ${config} is newer than the running ${TRAEFIK_CONTAINER}." >&2
+    echo "       Traefik reads that file ONCE, at process start; it does not" >&2
+    echo "       hot-reload, unlike traefik/dynamic/. The configuration in Git and" >&2
+    echo "       the configuration serving traffic therefore disagree, and rolling" >&2
+    echo "       now would report success without applying the change." >&2
+    echo "       Apply it, then re-run this deploy:" >&2
+    echo "         docker compose -f ${COMPOSE_FILE} up -d --no-deps --force-recreate traefik" >&2
+    echo "       That briefly drops in-flight connections, which is why a" >&2
+    echo "       zero-downtime rollout will not do it for you." >&2
+    return 1
+  fi
+  return 0
+}
+
 # Return 0 once >= expected backends report UP, 1 on timeout.
 wait_backends_up() {
   local service="$1" expected="$2" timeout="$3"
@@ -142,6 +230,43 @@ wait_backends_up() {
       echo "TIMEOUT: ${service} had ${up:-0} UP backends, wanted ${expected}" >&2
       return 1
     }
+    sleep 2; waited=$((waited + 2))
+  done
+}
+
+# Block until Traefik's pool for a service holds EXACTLY `expected` backends.
+#
+# wait_backends_up answers "are there enough new ones yet"; this answers "are
+# the old ones gone yet", and they are different questions. Retiring a
+# container removes its IP from the bridge, and packets to a vanished IP are
+# silently DROPPED -- no RST, nothing to fail fast on. So a request Traefik
+# dispatches to a backend it has not yet learned is gone does not 502, it
+# HANGS until the client's own timeout.
+#
+# That is not theoretical: it made a good release fail its own smoke check.
+# deploy.sh smokes immediately after the last roll, the `dashboard` probe hit a
+# just-removed backend, curl sat there until -m 15 and reported 000, and the
+# deploy auto-rolled-back a release that was fine. `web` is drained so its
+# backends leave the pool BEFORE they stop; `dashboard` is not drainable, so
+# for it the only thing that closes this window is waiting for Traefik to
+# converge.
+#
+# Warns rather than fails on timeout: this exists to remove a race, and a
+# service that genuinely never converges is caught by the smoke checks
+# immediately afterwards. Turning it into a hard failure would add a new way
+# for a completed roll to abort a deploy.
+wait_backends_settled() {
+  local service="$1" expected="$2" timeout="${3:-$SETTLE_TIMEOUT_SECS}"
+  local waited=0 up
+  while :; do
+    up=$(traefik_backends_up "$service" | grep -c " UP$" || true)
+    [ "${up:-0}" -eq "$expected" ] && return 0
+    if [ "$waited" -ge "$timeout" ]; then
+      echo "WARNING: ${service} still shows ${up:-0} UP backends, expected exactly ${expected}." >&2
+      echo "         Traefik has not finished retiring the old generation. Continuing;" >&2
+      echo "         the smoke checks will catch it if this is more than a delay." >&2
+      return 1
+    fi
     sleep 2; waited=$((waited + 2))
   done
 }
@@ -231,7 +356,7 @@ reconcile_command() {
 container_service_labels() {
   docker inspect \
     --format '{{range $k,$v := .Config.Labels}}{{println $k "=" $v}}{{end}}' "$1" 2>/dev/null \
-    | tr -d ' ' | grep '^traefik\.http\.services\.' | sort
+    | tr -d ' ' | grep '^traefik\.http\.services\.' | LC_ALL=C sort
 }
 
 # Desired labels come from the rendered compose file. JSON + python3 stdlib
@@ -434,6 +559,13 @@ roll_service() {
     echo "ERROR: ${service} converged to ${after_count} replicas, expected ${steady}" >&2
     return 1
   fi
+
+  # Docker agrees the old generation is gone; Traefik may not know yet. Return
+  # only once its pool matches, so a caller that probes immediately -- which
+  # deploy.sh and rollback.sh both do -- cannot be routed to a backend that no
+  # longer exists. See wait_backends_settled for why that hangs rather than
+  # failing fast.
+  wait_backends_settled "$service" "$steady" || true
 }
 
 # Roll a service with no Traefik backend (celery). SIGTERM is a warm shutdown:

@@ -34,7 +34,57 @@ echo ">>> rolling back to ${TARGET}"
 # Name the services explicitly. Only web, worker and dashboard interpolate
 # IMAGE_TAG; a bare `pull` would also re-pull the pinned third-party images,
 # which is slower and gives a rollback more ways to fail during an incident.
-docker compose -f "$COMPOSE_FILE" pull web worker dashboard
+#
+# A FAILED PULL MUST NOT ABORT THE ROLLBACK.
+#
+# Under `set -e` this used to be a bare `docker compose pull`, so anything that
+# made the registry unreachable -- a ghcr.io outage, an expired credential, a
+# DNS failure on the host -- ended the script here, exit 1, nothing rolled
+# back. That removes the recovery path at exactly the moment it is needed, and
+# it does so for a step that is usually unnecessary: rolling BACK means going
+# to a release that was recently running on this host, so its images are
+# almost always in the local image store already. The registry is an
+# optimisation here, not a dependency.
+#
+# So: try the pull; if it fails, require every image to be present locally and
+# continue loudly. Refuse only when one is genuinely missing, which is the one
+# case where continuing would create containers that cannot start -- and say
+# which, because "docker pull it by hand from somewhere" is then the operator's
+# next move.
+if ! docker compose -f "$COMPOSE_FILE" pull web worker dashboard; then
+  echo "WARNING: could not pull the ${TARGET} images." >&2
+  echo "         Checking whether they are already on this host..." >&2
+  missing=""
+  # The image list comes from the rendered compose file rather than being
+  # written out here, so it cannot drift from what compose will actually run.
+  for img in $(docker compose -f "$COMPOSE_FILE" config --format json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    svcs = json.load(sys.stdin)["services"]
+except Exception:
+    sys.exit(0)
+for image in sorted({svcs[s]["image"] for s in ("web", "worker", "dashboard") if s in svcs}):
+    print(image)
+'); do
+    if docker image inspect "$img" >/dev/null 2>&1; then
+      echo "         present: ${img}" >&2
+    else
+      echo "         MISSING: ${img}" >&2
+      missing="${missing} ${img}"
+    fi
+  done
+  if [ -n "$missing" ]; then
+    echo "ERROR: the registry is unreachable AND these images are not on this host:" >&2
+    for img in $missing; do echo "         ${img}" >&2; done
+    echo "       Nothing has been changed. Restore registry access, or load the" >&2
+    echo "       images from another source, then re-run this script." >&2
+    exit 1
+  fi
+  echo "WARNING: proceeding with the images already on this host. This is the" >&2
+  echo "         intended behaviour for a rollback -- the target release ran" >&2
+  echo "         here recently -- but it means the tag was NOT re-verified" >&2
+  echo "         against the registry." >&2
+fi
 
 # Unlike the deploy, rollback RECONCILES instead of refusing.
 #

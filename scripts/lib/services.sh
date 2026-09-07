@@ -53,11 +53,19 @@ APP_SERVICES=(
 #
 # The trailing `|| true` matters under the callers' `set -o pipefail`: a key
 # absent from .env makes `grep` exit 1, and pipefail promotes that to the whole
-# pipeline's exit status even though `head`/`cut`/`tr` all succeed on the empty
+# pipeline's exit status even though `head`/`cut`/`sed` all succeed on the empty
 # input. Without it, `pg_user="$(envval POSTGRES_USER)"` and the like would
 # abort the script on a merely-missing optional key, before the `:-default`
 # fallback the caller writes ever runs.
-envval() { grep -E "^${1}=" .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"'" || true; }
+#
+# The sed strips only a MATCHED surrounding pair of quotes. `tr -d "\"'"` --
+# what this used to do -- deletes every quote character anywhere in the value,
+# so a password of `a'b"c` silently becomes `abc` and the caller authenticates
+# with a credential nobody ever configured.
+envval() {
+  grep -E "^${1}=" .env 2>/dev/null | head -1 | cut -d= -f2- \
+    | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" || true
+}
 
 # The tag that is CURRENTLY DEPLOYED, from .release-state. Prints nothing when
 # the file is missing, unwritten (before the first successful deploy) or has no
