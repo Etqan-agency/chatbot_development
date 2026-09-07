@@ -953,6 +953,135 @@ check "the undeterminable list creates no container" "0" \
   "$(grep -cF -- '--scale' "$STUB_DIR/calls.log" || true)"
 
 # ---------------------------------------------------------------------------
+# check-vhost-drift.sh: the two files CD cannot deploy.
+#
+# docs/nginx/*.conf are reference copies; the live vhosts are root-owned and
+# outside DEPLOY_PATH, so the pipeline syncs everything in this repository
+# EXCEPT those two, and they are the only files that can drift without anything
+# saying so.
+#
+# The check compares behaviour, not bytes -- see the script header for why a
+# byte diff is permanently and correctly red. These tests pin both halves of
+# that: it must ignore the differences that are legitimate, and it must catch
+# the ones that route traffic somewhere else.
+# ---------------------------------------------------------------------------
+VHOST_DIR="$PROJ/vhost-live"
+
+# A minimal shipped vhost in the shape the real ones have: an active :80 block
+# and a commented-out :443 block that the install uncomments in step 3.
+write_repo_vhost() {
+  mkdir -p "$PROJ/docs/nginx"
+  cat > "$PROJ/docs/nginx/${1}.conf" <<EOF
+# Reference copy. Prose here must never be compared.
+#   proxy_pass http://127.0.0.1:9999;   <- a URL inside a comment
+server {
+    listen 80;
+    server_name ${2};
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+#server {
+#    listen 443 ssl;
+#    server_name ${2};
+#
+#    ssl_certificate /etc/letsencrypt/live/${2}/fullchain.pem;
+#    ssl_ciphers "ECDHE-RSA-AES128-GCM-SHA256";
+#
+#    client_max_body_size 25M;
+#    proxy_read_timeout 120s;
+#
+#    location / {
+#        proxy_pass http://127.0.0.1:8081;
+#        proxy_set_header Host \$host;
+#    }
+#}
+EOF
+}
+
+# The live counterpart: same behaviour, different TLS plumbing and comments.
+write_live_vhost() {
+  mkdir -p "$VHOST_DIR"
+  cat > "$VHOST_DIR/${2}" <<EOF
+# Installed by hand; comments differ and that is fine.
+server {
+    listen 80;
+    server_name ${2};
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+server {
+    listen 443 ssl;
+    server_name ${2};
+
+    ssl_certificate /etc/letsencrypt/live/${2}/fullchain.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    client_max_body_size 25M;
+    proxy_read_timeout 120s;
+
+    location / {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_set_header Host \$host;
+    }
+}
+EOF
+}
+
+drift_check() { ( cd "$PROJ" && bash scripts/check-vhost-drift.sh --live-dir "$VHOST_DIR" 2>&1 ); }
+
+setup_proj
+rm -rf "$PROJ/docs/nginx" "$VHOST_DIR"
+write_repo_vhost api api.example.test
+write_live_vhost api api.example.test
+out=$(drift_check); rc=$?
+check "matching behaviour passes despite different TLS plumbing" "0" "$rc"
+check "an include-vs-inlined TLS difference is not drift" "0" \
+  "$(grep -c 'DRIFTED' <<<"$out" || true)"
+check "a comment containing a directive is not compared" "0" \
+  "$(grep -c '9999' <<<"$out" || true)"
+
+# The whole point: a proxy_pass edited on the server and never brought back.
+sed -i 's|proxy_pass http://127.0.0.1:8081;|proxy_pass http://127.0.0.1:9999;|' \
+  "$VHOST_DIR/api.example.test"
+out=$(drift_check); rc=$?
+check "a changed proxy_pass is drift" "1" "$rc"
+check "the report names both sides of the change" "1" \
+  "$(grep -c 'on server, not in repo: proxy_pass http://127.0.0.1:9999' <<<"$out" || true)"
+
+# A forwarded header dropped on the server: the rate limiters key tenant
+# identity off X-Forwarded-For, so losing it collapses every tenant into one
+# bucket -- silently, and with every request still returning 200.
+write_live_vhost api api.example.test
+sed -i '/proxy_set_header Host/d' "$VHOST_DIR/api.example.test"
+out=$(drift_check); rc=$?
+check "a dropped proxy_set_header is drift" "1" "$rc"
+check "the report says which side is missing it" "1" \
+  "$(grep -c 'in repo, not on server: proxy_set_header Host' <<<"$out" || true)"
+
+# A vhost this repository describes that nginx is not serving at all.
+write_live_vhost api api.example.test
+rm -f "$VHOST_DIR/api.example.test"
+out=$(drift_check); rc=$?
+check "a missing live vhost is an error, not a pass" "1" "$rc"
+check "it names the file it looked for" "1" \
+  "$(grep -c 'api.example.test does not exist' <<<"$out" || true)"
+
+# An already-uncommented reference copy cannot be installed on a fresh host --
+# nginx refuses a `listen 443 ssl` block whose certificate does not exist yet,
+# and takes every site on the host down with it.
+write_repo_vhost api api.example.test
+write_live_vhost api api.example.test
+sed -i 's/^#//' "$PROJ/docs/nginx/api.conf"
+out=$(drift_check)
+check "a reference copy shipped with TLS live is called out" "1" \
+  "$(grep -c 'no commented-out :443 block' <<<"$out" || true)"
+
+rm -rf "$PROJ/docs/nginx" "$VHOST_DIR"
+
+# ---------------------------------------------------------------------------
 # wait_backends_settled: EXACTLY `expected`, not "at least".
 #
 # The distinction is the whole point. wait_backends_up returns as soon as there

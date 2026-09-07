@@ -66,6 +66,26 @@ echo "traefik published on loopback only"
 assert_gateway_config_applied traefik/traefik.yml || exit 1
 echo "traefik is running its current static configuration"
 
+# Host vhost drift. WARNS rather than refusing, unlike the gateway check above,
+# and the difference is deliberate.
+#
+# A stale traefik.yml makes THIS DEPLOY report a success it did not achieve --
+# the config change it was supposed to apply is not applied -- so refusing is
+# the only honest answer. A drifted vhost does not: the deploy is real either
+# way, and the mismatch is between the server and the repository's reference
+# copy of a file the pipeline cannot deploy. Blocking on it would put a
+# documentation reconciliation in the path of an urgent release, which is
+# precisely when someone edits a vhost on the server in the first place.
+#
+# So: loud on every deploy, and `bash scripts/check-vhost-drift.sh` exits
+# non-zero on its own for anyone who wants it as a gate.
+if ! check_out=$(bash scripts/check-vhost-drift.sh --quiet 2>&1); then
+  echo "WARNING: the host vhosts and docs/nginx/ disagree:" >&2
+  printf '%s\n' "$check_out" >&2
+else
+  echo "host vhosts match docs/nginx/"
+fi
+
 # The rolling swap health-gates on Traefik's API. That API is enabled by a
 # traefik.yml change that does NOT hot-reload -- it needs a manual container
 # restart. Without this check the deploy would get all the way past migrate and

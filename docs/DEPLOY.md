@@ -174,6 +174,14 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
      changed — a header, a timeout, a body-size limit — copy the change into
      both places yourself; nothing else does it for you.
 
+     `deploy.sh` reports any disagreement on every deploy, and
+     `bash scripts/check-vhost-drift.sh` gives the same answer on demand with a
+     non-zero exit. It compares behaviour, not bytes: where traffic is proxied,
+     which hostnames and ports are answered, the upload ceiling, the proxy
+     timeouts and the forwarded headers. TLS plumbing and comments are ignored,
+     because those differ legitimately between a host that has run
+     `certbot --nginx` and one that has only ever run `certonly --webroot`.
+
      **The shipped vhosts contain a `:80` server block only** — no `listen
      443`, no `ssl_certificate`. That is deliberate and must stay that way
      until certbot has run. A `listen 443 ssl` block whose certificate lines
@@ -703,12 +711,15 @@ be read as covering it.
   `proxy_read_timeout` (`docs/nginx/*.conf`, both `25M`/`120s`) must stay at
   or above the dashboard's own internal nginx (also `25M`/`120s`) or a request
   that the dashboard's nginx would have allowed fails one hop earlier, at the
-  host vhost, before it ever reaches Traefik or `web`. **There is no automated
-  check that the two agree** — a deliberate gap, because the host vhost is
-  not deployed by CD (§2): nothing in CI or `deploy.sh` reads
-  `docs/nginx/*.conf`, let alone the live files under
-  `/etc/nginx/sites-available/`, so there is nothing for an automated check to
-  compare against without also changing how the vhosts are deployed.
+  host vhost, before it ever reaches Traefik or `web`. **`scripts/check-vhost-drift.sh` now
+  compares the repository's reference copies against the live vhosts** and
+  `deploy.sh` runs it on every deploy, so a value edited on the server and
+  never brought back is reported rather than silently kept. It warns instead
+  of refusing: unlike stale Traefik static config, a drifted vhost does not
+  make the deploy itself dishonest, and blocking on it would put a
+  documentation reconciliation in the path of an urgent release. What it still
+  does **not** check is that these values stay at or above the dashboard's own
+  internal nginx — that pairing is a judgement, not an equality.
 
 - **HSTS is set in exactly one place, and only because of one setting**:
   Traefik's `secure-headers` middleware (`traefik/dynamic/middlewares.yml`).
