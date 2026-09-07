@@ -79,12 +79,16 @@ echo "traefik is running its current static configuration"
 #
 # So: loud on every deploy, and `bash scripts/check-vhost-drift.sh` exits
 # non-zero on its own for anyone who wants it as a gate.
-if ! check_out=$(bash scripts/check-vhost-drift.sh --quiet 2>&1); then
-  echo "WARNING: the host vhosts and docs/nginx/ disagree:" >&2
-  printf '%s\n' "$check_out" >&2
-else
-  echo "host vhosts match docs/nginx/"
-fi
+check_out=$(bash scripts/check-vhost-drift.sh --quiet 2>&1) && drift_rc=0 || drift_rc=$?
+case "$drift_rc" in
+  0) echo "host vhosts match docs/nginx/" ;;
+  1) echo "WARNING: the host vhosts and docs/nginx/ disagree:" >&2
+     printf '%s\n' "$check_out" >&2 ;;
+  # Distinct from drift on purpose. "Could not check" reported as "disagree"
+  # sends the reader to reconcile two files that were never compared.
+  *) echo "WARNING: could not check the host vhosts against docs/nginx/:" >&2
+     printf '%s\n' "$check_out" >&2 ;;
+esac
 
 # The rolling swap health-gates on Traefik's API. That API is enabled by a
 # traefik.yml change that does NOT hot-reload -- it needs a manual container

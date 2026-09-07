@@ -1079,6 +1079,23 @@ out=$(drift_check)
 check "a reference copy shipped with TLS live is called out" "1" \
   "$(grep -c 'no commented-out :443 block' <<<"$out" || true)"
 
+# "Could not check" must not read as "checked and found drift". This shipped
+# wrong once: CD synced traefik/, scripts/ and media/ to the server but not
+# docs/nginx/, so the check ran against nothing and deploy.sh reported the
+# vhosts as disagreeing -- pointing an operator at a reconciliation between two
+# files that had never been compared.
+setup_proj
+rm -rf "$PROJ/docs/nginx" "$VHOST_DIR"
+mkdir -p "$VHOST_DIR"
+out=$(drift_check); rc=$?
+check "no reference copies at all exits 2, not 1" "2" "$rc"
+check "it says nothing was compared" "1" \
+  "$(grep -c 'no vhosts compared' <<<"$out" || true)"
+check "it does not call that a disagreement" "0" \
+  "$(grep -c 'DRIFTED' <<<"$out" || true)"
+check "it names the sync as the likely cause" "1" \
+  "$(grep -c 'that sync is broken' <<<"$out" || true)"
+
 rm -rf "$PROJ/docs/nginx" "$VHOST_DIR"
 
 # ---------------------------------------------------------------------------

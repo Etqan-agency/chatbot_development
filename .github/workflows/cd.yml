@@ -203,6 +203,15 @@ jobs:
           # happens to be on the server -- or fails to start if nothing is.
           rsync -avz --delete -e "${SSH_CMD}" media/ \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/media/"
+          # docs/nginx/ holds the REFERENCE copies of the host vhosts. Nothing
+          # on the server consumes them as configuration -- the live vhosts are
+          # under /etc/nginx/sites-available/ and are installed by hand -- but
+          # deploy.sh's drift check needs something to compare the live files
+          # against, and it runs on the server. Without this the check reports
+          # "no vhosts compared" on every deploy, which is how it shipped the
+          # first time.
+          rsync -avz --delete -e "${SSH_CMD}" docs/nginx/ \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/docs/nginx/"
 
       - name: Deploy
         env:

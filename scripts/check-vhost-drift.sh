@@ -3,6 +3,8 @@
 #
 #   bash scripts/check-vhost-drift.sh [--live-dir DIR] [--quiet]
 #
+# Exit 0 in sync, 1 drifted, 2 could not check.
+#
 # docs/nginx/*.conf are reference copies. The live files are under
 # /etc/nginx/sites-available/, outside DEPLOY_PATH and root-owned, so CD cannot
 # deploy them and the two are kept in step by hand. Every other file in this
@@ -123,9 +125,16 @@ for repo_conf in docs/nginx/*.conf; do
     | sed 's/^/      on server, not in repo: /' >&2
 done
 
+# Exit 2, not 1, and the distinction is the point: 1 means "compared them and
+# they disagree", 2 means "could not compare them at all". Reporting an
+# unrunnable check as a finding is how a check that never ran gets mistaken for
+# one that passed, or -- as here -- for one that failed on the merits.
 if [ "$checked" -eq 0 ] && [ "$drift" -eq 0 ]; then
-  echo "ERROR: no vhosts compared. docs/nginx/*.conf matched nothing." >&2
-  exit 1
+  echo "ERROR: no vhosts compared -- docs/nginx/*.conf matched nothing under $(pwd)." >&2
+  echo "       On the server, CD syncs docs/nginx/ into DEPLOY_PATH for exactly" >&2
+  echo "       this check; if it is missing, that sync is broken rather than the" >&2
+  echo "       vhosts being in sync." >&2
+  exit 2
 fi
 
 if [ "$drift" -ne 0 ]; then
