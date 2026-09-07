@@ -927,6 +927,31 @@ check "the refusal creates no container" "0" \
 check "the refusal stops no container" "0" \
   "$(grep -c '^stop ' "$STUB_DIR/calls.log" || true)"
 
+# The registry is unreachable AND the image list cannot be determined.
+#
+# The list is derived from `compose config --format json`, whose failures were
+# swallowed: an unrenderable compose file yielded an EMPTY list, the
+# present/missing loop then ran zero times, `missing` stayed empty, and the
+# script announced "proceeding with the images already on this host" -- having
+# verified nothing at all. A guard that reports success when it could not run
+# is worse than no guard, because it is the pull failure path, so it only ever
+# executes when something is already wrong.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+: > "$STUB_DIR/compose_json"   # config renders nothing
+printf 'CURRENT=rbtag\nPREVIOUS=older\n' > "$PROJ/.release-state"
+echo 1 > "$STUB_DIR/pull_rc"
+: > "$STUB_DIR/calls.log"
+err=$(bash "$PROJ/scripts/rollback.sh" rbtag 2>&1 >/dev/null); rc=$?
+check "an undeterminable image list with no registry refuses" "1" "$rc"
+check "it does not claim the local images are fine" "0" \
+  "$(grep -c 'images already on this host' <<<"$err" || true)"
+check "the refusal says the image list could not be determined" "1" \
+  "$(grep -c 'could not determine which images' <<<"$err" || true)"
+check "the undeterminable list creates no container" "0" \
+  "$(grep -cF -- '--scale' "$STUB_DIR/calls.log" || true)"
+
 # ---------------------------------------------------------------------------
 # wait_backends_settled: EXACTLY `expected`, not "at least".
 #

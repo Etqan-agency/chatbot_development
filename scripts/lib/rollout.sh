@@ -202,7 +202,14 @@ assert_gateway_config_applied() {
     return 0
   fi
 
-  file_mtime=$(stat -c %Y "$config" 2>/dev/null) || return 0
+  # Only reachable if the file disappears between the -f test above and here.
+  # Warn rather than return silently: every other unable-to-check path in this
+  # function says so, and a guard that passes without a word is indistinguishable
+  # from a guard that ran.
+  if ! file_mtime=$(stat -c %Y "$config" 2>/dev/null); then
+    echo "WARNING: ${config} became unreadable; skipping the static-configuration check." >&2
+    return 0
+  fi
 
   # Strictly greater: a container started in the same second the file was
   # written did read it, and refusing on that coincidence would fail a

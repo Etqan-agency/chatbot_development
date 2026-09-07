@@ -57,7 +57,7 @@ if ! docker compose -f "$COMPOSE_FILE" pull web worker dashboard; then
   missing=""
   # The image list comes from the rendered compose file rather than being
   # written out here, so it cannot drift from what compose will actually run.
-  for img in $(docker compose -f "$COMPOSE_FILE" config --format json 2>/dev/null | python3 -c '
+  images=$(docker compose -f "$COMPOSE_FILE" config --format json 2>/dev/null | python3 -c '
 import json, sys
 try:
     svcs = json.load(sys.stdin)["services"]
@@ -65,7 +65,21 @@ except Exception:
     sys.exit(0)
 for image in sorted({svcs[s]["image"] for s in ("web", "worker", "dashboard") if s in svcs}):
     print(image)
-'); do
+')
+  # An empty list is a FAILURE to check, not a clean bill of health. Both the
+  # compose render and the parse above degrade to producing nothing, and the
+  # loop below then runs zero times, leaves `missing` empty, and falls through
+  # to "proceeding with the images already on this host" -- announcing a
+  # verification that never happened. This path only ever runs because the pull
+  # already failed, so it is exactly where an unearned reassurance does damage.
+  if [ -z "$images" ]; then
+    echo "ERROR: the registry is unreachable AND this script could not determine which images" >&2
+    echo "       the rollback needs: rendering ${COMPOSE_FILE} produced no image for web," >&2
+    echo "       worker or dashboard. Nothing has been changed. Check the compose file with:" >&2
+    echo "         docker compose -f ${COMPOSE_FILE} config" >&2
+    exit 1
+  fi
+  for img in $images; do
     if docker image inspect "$img" >/dev/null 2>&1; then
       echo "         present: ${img}" >&2
     else

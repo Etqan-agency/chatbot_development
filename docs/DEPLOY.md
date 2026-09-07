@@ -769,10 +769,24 @@ production.
    docker compose -f docker-compose.production.yml run --rm web \
      python manage.py setup_pgvector
    ```
-   This creates the `vector` extension and HNSW index and backfills it from
-   the restored `DocumentChunk.embedding` JSON column — the dump/restore in
-   step 1 carries the JSON values, not the pgvector column, so this step is
-   what makes them searchable again.
+   This creates the `vector` extension and column and backfills it from the
+   restored `DocumentChunk.embedding` JSON column — the dump/restore in step 1
+   carries the JSON values, not the pgvector column, so this step is what makes
+   them searchable again.
+
+   **Read the command's closing line; do not assume this step produced an
+   index.** pgvector cannot build an HNSW index on a `vector` column above 2000
+   dimensions, and the configured `EMBEDDING_MODEL` is `text-embedding-3-large`,
+   which is 3072. As configured today this step therefore ends with
+   `pgvector is ENABLED BUT NOT INDEXED`: searches return correct results by
+   scanning every chunk, which is fine at the current corpus size and will not
+   stay fine. Getting an index means either re-embedding with a ≤2000-dim model
+   (`text-embedding-3-small`, 1536) or storing as `halfvec`, which indexes to
+   4000 — a decision worth making deliberately rather than discovering later.
+
+   The command also needs at least one embedding present to infer the
+   dimension, which is why it runs *after* the restore. Pass `--dim` only if
+   you are setting up ahead of the data.
 
 4. **Deploy the new stack and smoke-check it against the new hostnames**
    while the old stack still serves production traffic. This is exactly the
