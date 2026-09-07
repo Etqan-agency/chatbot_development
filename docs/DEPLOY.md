@@ -774,15 +774,26 @@ production.
    carries the JSON values, not the pgvector column, so this step is what makes
    them searchable again.
 
-   **Read the command's closing line; do not assume this step produced an
-   index.** pgvector cannot build an HNSW index on a `vector` column above 2000
-   dimensions, and the configured `EMBEDDING_MODEL` is `text-embedding-3-large`,
-   which is 3072. As configured today this step therefore ends with
-   `pgvector is ENABLED BUT NOT INDEXED`: searches return correct results by
-   scanning every chunk, which is fine at the current corpus size and will not
-   stay fine. Getting an index means either re-embedding with a ≤2000-dim model
-   (`text-embedding-3-small`, 1536) or storing as `halfvec`, which indexes to
-   4000 — a decision worth making deliberately rather than discovering later.
+   **Read the command's closing line.** It reports which of two outcomes it
+   produced, and they are not equivalent. The configured `EMBEDDING_MODEL` is
+   `text-embedding-3-large` at 3072 dimensions, and pgvector will not build an
+   HNSW index on a `vector` column above 2000 — so at this width the index is
+   built on the column's `halfvec` cast instead. Storage keeps full float32
+   precision; only index search runs at 16 bits, for a small but non-zero
+   recall cost. Expect:
+
+   ```
+   pgvector is ready, with an HNSW cosine index over halfvec(3072).
+   ```
+
+   The `halfvec` type needs pgvector 0.7.0 or newer. On an older server the
+   command builds no index at all and says so, ending with
+   `pgvector is ENABLED BUT NOT INDEXED` — correct results by sequential scan
+   over every chunk. That is not a state to deploy into and leave; upgrade
+   pgvector, or move to a ≤2000-dim model and re-embed.
+
+   Either way the `knowledge.W002` system check reports an unindexed table on
+   every subsequent deploy, so this cannot pass unnoticed.
 
    The command also needs at least one embedding present to infer the
    dimension, which is why it runs *after* the restore. Pass `--dim` only if
