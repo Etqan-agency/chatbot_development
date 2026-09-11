@@ -2,7 +2,7 @@
 # Print a shipped vhost from docs/nginx/ with its :443 block uncommented --
 # step 3 of the install procedure in that file's header, done mechanically.
 #
-#   bash scripts/e2e/uncomment-tls.sh docs/nginx/api-chatbot-demo.conf
+#   bash scripts/e2e/uncomment-tls.sh docs/nginx/api.chatbot-demo.conf
 #
 # scripts/e2e.sh uses this to stand the real vhosts up against a self-signed
 # certificate, which is what makes the rehearsal test the FILE THAT SHIPS

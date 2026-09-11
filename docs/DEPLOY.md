@@ -157,9 +157,9 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
      vhosts from `docs/nginx/` into `/etc/nginx/sites-available/` and enable
      them:
      ```bash
-     sudo cp docs/nginx/api-chatbot-demo.conf \
+     sudo cp docs/nginx/api.chatbot-demo.conf \
        /etc/nginx/sites-available/api.chatbot-demo.etqanbackend.tech
-     sudo cp docs/nginx/app-chatbot-demo.conf \
+     sudo cp docs/nginx/app.chatbot-demo.conf \
        /etc/nginx/sites-available/app.chatbot-demo.etqanbackend.tech
      sudo ln -s /etc/nginx/sites-available/api.chatbot-demo.etqanbackend.tech \
        /etc/nginx/sites-enabled/
