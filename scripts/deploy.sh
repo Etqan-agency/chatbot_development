@@ -34,7 +34,7 @@ STATE_FILE=.release-state
 # from services.sh, so a rollback reads the same values through the same code.
 #
 # Two independent keys, not a base domain: this host's names share a parent by
-# coincidence, and `abdulkhalek.dev` belongs to several other servers.
+# coincidence, and `etqanbackend.tech` belongs to several other servers.
 API_HOST="$(envval API_HOST)"
 APP_HOST="$(envval APP_HOST)"
 [ -n "$API_HOST" ] || { echo "API_HOST is not set in .env" >&2; exit 1; }

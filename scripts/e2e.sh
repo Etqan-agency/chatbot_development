@@ -155,8 +155,8 @@ fi
 # Hostnames come from the SHIPPED vhosts, not from a constant here: if
 # .env.example and docs/nginx/ ever name different hosts, the deploy smoke
 # checks would probe a name the edge does not serve. Assert they agree.
-API_HOST=$(sed -n 's/^    server_name \(.*\);/\1/p' docs/nginx/api-demo-chatbot.conf | head -1)
-APP_HOST=$(sed -n 's/^    server_name \(.*\);/\1/p' docs/nginx/app-demo-chatbot.conf | head -1)
+API_HOST=$(sed -n 's/^    server_name \(.*\);/\1/p' docs/nginx/api-chatbot-demo.conf | head -1)
+APP_HOST=$(sed -n 's/^    server_name \(.*\);/\1/p' docs/nginx/app-chatbot-demo.conf | head -1)
 env_api=$(sed -n 's/^API_HOST=//p' .env.example | head -1)
 env_app=$(sed -n 's/^APP_HOST=//p' .env.example | head -1)
 check "the api vhost and .env.example name the same host" "$env_api" "$API_HOST"
@@ -169,12 +169,12 @@ check "the app vhost and .env.example name the same host" "$env_app" "$APP_HOST"
 # old, wrong reasoning. That is exactly how the IPv6 sorting argument came to
 # name the wrong file in one of them.
 # Substitute the short prefix, not the FQDN: the header abbreviates the
-# hostname as `api-demo-chatbot...` in prose, which an FQDN substitution leaves
+# hostname as `api-chatbot-demo...` in prose, which an FQDN substitution leaves
 # untouched -- so the check would report drift on the exact sentence it exists
 # to police. `1d` drops the one line that is legitimately different, each
 # file's "chatbot API"/"chatbot dashboard" description.
-drift=$(diff <(sed -e "s/api-demo-chatbot/HOST/g" -e '1d' docs/nginx/api-demo-chatbot.conf) \
-             <(sed -e "s/app-demo-chatbot/HOST/g" -e '1d' docs/nginx/app-demo-chatbot.conf) | wc -l)
+drift=$(diff <(sed -e "s/api-chatbot-demo/HOST/g" -e '1d' docs/nginx/api-chatbot-demo.conf) \
+             <(sed -e "s/app-chatbot-demo/HOST/g" -e '1d' docs/nginx/app-chatbot-demo.conf) | wc -l)
 check "the two vhosts are in sync modulo the hostname" "0" "$drift"
 
 # --- 1. build the stand-ins -------------------------------------------------
@@ -212,7 +212,7 @@ for host in "$API_HOST" "$APP_HOST"; do
     -out    "$WORK/edge/letsencrypt/live/${host}/fullchain.pem" \
     -subj "/CN=${host}" -addext "subjectAltName=DNS:${host}" >/dev/null 2>&1
 done
-for pair in "api-demo-chatbot api" "app-demo-chatbot app"; do
+for pair in "api-chatbot-demo api" "app-chatbot-demo app"; do
   # shellcheck disable=SC2086  # the pair is a deliberate word-split argument list
   set -- $pair
   bash scripts/e2e/uncomment-tls.sh "docs/nginx/${1}.conf" \

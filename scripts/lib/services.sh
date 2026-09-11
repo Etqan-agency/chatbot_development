@@ -89,7 +89,7 @@ release_current() {
 # ONE definition, so a rollback can never verify less than the deploy gated on.
 #
 # Two independent hostnames, not a base domain with derived prefixes. They share
-# a parent today, but nothing here may depend on that: `abdulkhalek.dev` is used
+# a parent today, but nothing here may depend on that: `etqanbackend.tech` is used
 # by several unrelated servers, and this host owns exactly these two names.
 #
 # The media probe is not optional: it is the only check that exercises the
