@@ -60,12 +60,12 @@ infrastructure that isn't safe or meaningful to roll this way.
 Two hostnames, **independent** — `API_HOST` and `APP_HOST`, `.env` values on
 the server; nothing derives one from the other:
 
-- **`API_HOST`** (`api-demo-chatbot.abdulkhalek.dev`) serves the Django API on
+- **`API_HOST`** (`api.chatbot-demo.etqanbackend.tech`) serves the Django API on
   the `api` router, and `/media/` on a separate `media` router with
   **priority 100** (higher than `api`'s default rule-length priority), so a
   request for `/media/...` on that host goes to the `media` service, not to
   `web`.
-- **`APP_HOST`** (`app-demo-chatbot.abdulkhalek.dev`) serves the React SPA
+- **`APP_HOST`** (`app.chatbot-demo.etqanbackend.tech`) serves the React SPA
   (`dashboard`). The dashboard's own nginx proxies `/api/` **same-origin**,
   straight to `web:8000` over Docker DNS — this request never goes through
   Traefik. See §8 for why that matters.
@@ -147,8 +147,8 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
    are decoupled from deploys entirely: nothing in `deploy.sh` talks to Let's
    Encrypt, so this step has no deadline relative to CD, only relative to DNS.
 
-   - **DNS A and AAAA records for both `api-demo-chatbot.abdulkhalek.dev` and
-     `app-demo-chatbot.abdulkhalek.dev`, pointing at this host, must exist
+   - **DNS A and AAAA records for both `api.chatbot-demo.etqanbackend.tech` and
+     `app.chatbot-demo.etqanbackend.tech`, pointing at this host, must exist
      before certbot runs** (not before the first deploy — see above). certbot
      uses the same HTTP-01 challenge Traefik's dormant resolver would have
      used: it resolves the hostname over the public internet to validate
@@ -157,13 +157,13 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
      vhosts from `docs/nginx/` into `/etc/nginx/sites-available/` and enable
      them:
      ```bash
-     sudo cp docs/nginx/api-demo-chatbot.conf \
-       /etc/nginx/sites-available/api-demo-chatbot.abdulkhalek.dev
-     sudo cp docs/nginx/app-demo-chatbot.conf \
-       /etc/nginx/sites-available/app-demo-chatbot.abdulkhalek.dev
-     sudo ln -s /etc/nginx/sites-available/api-demo-chatbot.abdulkhalek.dev \
+     sudo cp docs/nginx/api.chatbot-demo.conf \
+       /etc/nginx/sites-available/api.chatbot-demo.etqanbackend.tech
+     sudo cp docs/nginx/app.chatbot-demo.conf \
+       /etc/nginx/sites-available/app.chatbot-demo.etqanbackend.tech
+     sudo ln -s /etc/nginx/sites-available/api.chatbot-demo.etqanbackend.tech \
        /etc/nginx/sites-enabled/
-     sudo ln -s /etc/nginx/sites-available/app-demo-chatbot.abdulkhalek.dev \
+     sudo ln -s /etc/nginx/sites-available/app.chatbot-demo.etqanbackend.tech \
        /etc/nginx/sites-enabled/
      sudo nginx -t && sudo systemctl reload nginx
      ```
@@ -194,9 +194,9 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
    - **Obtain the certificates with `certonly --webroot`, not `--nginx`:**
      ```bash
      sudo certbot certonly --webroot -w /var/www/html \
-       -d api-demo-chatbot.abdulkhalek.dev
+       -d api.chatbot-demo.etqanbackend.tech
      sudo certbot certonly --webroot -w /var/www/html \
-       -d app-demo-chatbot.abdulkhalek.dev
+       -d app.chatbot-demo.etqanbackend.tech
      ```
      **Do not use `certbot --nginx` here.** The nginx plugin does not create a
      second server block: with only a `:80` server present it *appends*
@@ -247,7 +247,7 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
      ```bash
      curl -sS -o /dev/null -L --max-redirs 3 \
        -w 'code=%{http_code} redirects=%{num_redirects}\n' \
-       https://api-demo-chatbot.abdulkhalek.dev/
+       https://api.chatbot-demo.etqanbackend.tech/
      ```
      Expect `redirects=0`. A `curl: (47) Maximum (3) redirects followed` means
      the `:80` and `:443` blocks have been merged into one server.
@@ -833,7 +833,7 @@ catch any of them, they don't.
 
 - **Paddle webhook URL** is registered in Paddle's dashboard against the old
   host. Until it's repointed at
-  `https://api-demo-chatbot.abdulkhalek.dev/api/v1/billing/paddle/webhook/`, Paddle keeps sending
+  `https://api.chatbot-demo.etqanbackend.tech/api/v1/billing/paddle/webhook/`, Paddle keeps sending
   webhook events to a host that no longer answers for them and **payments
   stop being fulfilled** with no visible error on the buyer's side. Verify
   with a sandbox event **before** the flip, not after.
@@ -862,22 +862,22 @@ Tick these off once, before the very first real deploy against this host:
 
 1. **DNS resolves both hostnames:**
    ```bash
-   dig +short api-demo-chatbot.abdulkhalek.dev
-   dig +short app-demo-chatbot.abdulkhalek.dev
+   dig +short api.chatbot-demo.etqanbackend.tech
+   dig +short app.chatbot-demo.etqanbackend.tech
    ```
    both return this host's IP.
 2. **certbot lists both certificates with a future expiry:**
    ```bash
    sudo certbot certificates
    ```
-   shows both `api-demo-chatbot.abdulkhalek.dev` and
-   `app-demo-chatbot.abdulkhalek.dev`, each with an `Expiry Date` in the
+   shows both `api.chatbot-demo.etqanbackend.tech` and
+   `app.chatbot-demo.etqanbackend.tech`, each with an `Expiry Date` in the
    future. If either is missing, certbot has not been run for that host yet
    (§2, step 7) — recheck DNS before retrying.
 3. **The certificate nginx actually serves is real, not self-signed or
    expired:**
    ```bash
-   curl -sI https://api-demo-chatbot.abdulkhalek.dev/health/
+   curl -sI https://api.chatbot-demo.etqanbackend.tech/health/
    ```
    returns `HTTP/2 200` (or `HTTP/1.1 200`) with no certificate warning. A
    `curl` certificate complaint here means nginx is not yet serving the
