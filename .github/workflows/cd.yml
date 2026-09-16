@@ -112,13 +112,48 @@ jobs:
             "${REGISTRY}/${IMAGE_PREFIX}/api:${TAG}"
             "${REGISTRY}/${IMAGE_PREFIX}/dashboard:${TAG}"
           )
+          # A failed `docker manifest inspect` is NOT proof the image is missing.
+          # GHCR serves manifests and blobs through a CDN that resets connections
+          # often enough to hit a deploy, and the old code reported every failure
+          # as "Image not found" -- which sends whoever is on call hunting for a
+          # broken build that was never broken, on a deploy CI had already
+          # verified. So: retry the transport, and call an image missing only
+          # when the registry itself says so.
           for IMAGE in "${IMAGES[@]}"; do
             echo "Verifying: ${IMAGE}"
-            docker manifest inspect "${IMAGE}" > /dev/null || {
-              echo "ERROR: Image not found: ${IMAGE}"
-              exit 1
-            }
-            echo "OK: ${IMAGE}"
+            for attempt in 1 2 3 4 5; do
+              if ERR=$(docker manifest inspect "${IMAGE}" 2>&1 >/dev/null); then
+                echo "OK: ${IMAGE}"
+                break
+              fi
+
+              # The registry answering "I have no such manifest" is final --
+              # no number of retries changes it, and the deploy must stop.
+              if grep -qiE 'manifest unknown|manifest unverified|no such manifest|not found' <<<"${ERR}"; then
+                echo "ERROR: Image not found in the registry: ${IMAGE}" >&2
+                echo "       ${ERR}" >&2
+                exit 1
+              fi
+
+              # Credentials, not connectivity. Also not retryable, and it needs
+              # a different fix than a missing image does.
+              if grep -qiE 'denied|unauthorized|forbidden|authentication required' <<<"${ERR}"; then
+                echo "ERROR: Access denied reading ${IMAGE} -- check the registry login and packages:read." >&2
+                echo "       ${ERR}" >&2
+                exit 1
+              fi
+
+              if [ "${attempt}" -eq 5 ]; then
+                echo "ERROR: Could not reach the registry for ${IMAGE} after 5 attempts." >&2
+                echo "       This is a transport failure, NOT a missing image -- re-run the deploy." >&2
+                echo "       Last error: ${ERR}" >&2
+                exit 1
+              fi
+
+              echo "  registry unreachable (attempt ${attempt}/5), retrying in $((attempt * 5))s"
+              echo "  ${ERR}"
+              sleep $((attempt * 5))
+            done
           done
           echo "Both images verified."
 
