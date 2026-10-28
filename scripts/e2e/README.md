@@ -11,7 +11,7 @@ smoke check, and rolls it back — asserting at each step. Wired into CI as the
 
 | | |
 |---|---|
-| **Real** | `docker-compose.production.yml`, `traefik/traefik.yml`, `traefik/dynamic/middlewares.yml`, `media/nginx.conf`, `docs/nginx/*.conf`, `scripts/deploy.sh`, `scripts/rollback.sh`, `scripts/lib/*`, postgres, redis, traefik, the socket proxy |
+| **Real** | `docker-compose.production.yml`, `traefik/traefik.yml`, `traefik/dynamic/middlewares.yml`, `media/nginx.conf`, `scripts/deploy.sh`, `scripts/rollback.sh`, `scripts/lib/*`, postgres, redis, traefik, the socket proxy. Traefik is the edge here exactly as in production — it owns both ports and terminates TLS. |
 | **Stand-in** | the two application images only — `api-standin/`, `dashboard-standin/` |
 
 The stand-ins are built and tagged as `ghcr.io/etqan-agency/chatbot/{api,dashboard}`,
@@ -50,8 +50,9 @@ outside the stub's model. This does:
   design does not claim)
 - `pg_dump | gzip` really reports its failures — against the real postgres
   image, including whether `bash` and `set -o pipefail` exist there at all
-- the vhosts we ship really parse with the `:443` block enabled, **without**
-  certbot's installer-only files present
+- Traefik really terminates TLS, really redirects `:80` to `:443`, and really
+  leaves `/.well-known/acme-challenge/` unredirected — the priority ordering
+  the whole certificate-renewal path depends on
 - a rollback really survives an unreachable registry
 - the pool really converges after a roll, before anything probes it
 

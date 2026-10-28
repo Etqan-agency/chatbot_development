@@ -37,7 +37,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   # Must be lowercase for the Docker registry.
-  IMAGE_PREFIX: etqan-agency/chatbot
+  IMAGE_PREFIX: etqan-agency/chatbot-zaychain
 
 jobs:
   wait-for-ci:
@@ -238,25 +238,12 @@ jobs:
           # happens to be on the server -- or fails to start if nothing is.
           rsync -avz --delete -e "${SSH_CMD}" media/ \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/media/"
-          # docs/nginx/ holds the REFERENCE copies of the host vhosts. Nothing
-          # on the server consumes them as configuration -- the live vhosts are
-          # under /etc/nginx/sites-available/ and are installed by hand -- but
-          # deploy.sh's drift check needs something to compare the live files
-          # against, and it runs on the server. Without this the check reports
-          # "no vhosts compared" on every deploy, which is how it shipped the
-          # first time.
-          #
-          # mkdir first: rsync creates the LAST path component but not missing
-          # parents, and nothing else puts a docs/ directory on the server, so
-          # this failed with
-          #   rsync: [Receiver] mkdir ".../docs/nginx" failed: No such file or
-          #   directory (2)
-          # and took the whole deploy down at the sync step. (`--mkpath` would
-          # also do it, but it needs rsync >= 3.2.3 on both ends and this needs
-          # no version argument.)
-          ${SSH_CMD} "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p ${DEPLOY_PATH}/docs"
-          rsync -avz --delete -e "${SSH_CMD}" docs/nginx/ \
-            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/docs/nginx/"
+          # docs/ is deliberately NOT synced. It used to carry docs/nginx/, the
+          # reference copies of the host vhosts, because deploy.sh's drift check
+          # compared the live root-owned vhosts against them and ran on the
+          # server. Traefik owns the edge now: there is no host nginx, no
+          # hand-installed vhost, and no drift check -- the gateway's entire
+          # configuration is traefik/ and the compose labels, both synced above.
 
       - name: Deploy
         env:

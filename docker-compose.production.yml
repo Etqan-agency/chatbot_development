@@ -36,13 +36,22 @@ services:
     image: traefik:v3.6.25
     restart: unless-stopped
     ports:
-      # 127.0.0.1 ONLY. Published on 0.0.0.0 this serves the entire stack over
-      # plain http on 8081, bypassing nginx's TLS and its access log -- and
-      # ufw does not help, because Docker's iptables rules are inserted ahead
-      # of it. (Rate limiting is Traefik's, not nginx's, and stays in force on
-      # this path either way.) deploy.sh's preflight refuses to run if any
-      # published mapping here is not on 127.0.0.1.
-      - "127.0.0.1:8081:80"
+      # Traefik IS the edge on this topology: it owns both public ports and
+      # terminates TLS itself. There is no nginx on the host.
+      #
+      # These are deliberately published on 0.0.0.0. Note that Docker inserts
+      # its own iptables rules ahead of ufw's, so these two ports are reachable
+      # whether or not ufw has a matching `allow` -- ufw is not what is
+      # controlling exposure here, and adding rules for these ports does not
+      # change anything. What IS controlled: :80 serves only the ACME challenge
+      # and a 301 to https (see traefik/traefik.yml), so no application traffic
+      # crosses the network in cleartext.
+      #
+      # deploy.sh's preflight asserts exactly this shape -- both ports, and no
+      # OTHER published mapping. A stray publication here (the API entrypoint
+      # above all) would expose the whole routing configuration.
+      - "80:80"
+      - "443:443"
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
@@ -100,7 +109,7 @@ services:
       retries: 10
 
   web:
-    image: ghcr.io/etqan-agency/chatbot/api:${IMAGE_TAG:-latest}
+    image: ghcr.io/etqan-agency/chatbot-zaychain/api:${IMAGE_TAG:-latest}
     restart: unless-stopped
     env_file: .env
     # RUN_MIGRATIONS is deliberately NOT set. docker/entrypoint.sh gates
@@ -120,12 +129,21 @@ services:
       replicas: 2
     labels:
       - "traefik.enable=true"
-      # Plain http on the `web` entrypoint: the host's nginx terminates TLS and
-      # proxies here over loopback. No tls/certresolver labels -- see the
-      # dormant ACME note in traefik/traefik.yml.
+      # The public TLS entrypoint. No `tls.certresolver` label here on purpose:
+      # the resolver is set once on the web-secure entrypoint in
+      # traefik/traefik.yml, so a new route cannot forget it and silently serve
+      # Traefik's self-signed default instead.
+      #
+      # `csrf-headers@file` is gone. It hardcoded X-Forwarded-Proto: https to
+      # compensate for TLS ending at the host nginx; Traefik sets that header
+      # correctly by itself when it terminates TLS. Restoring it would assert
+      # https on plaintext :80 requests too.
       - "traefik.http.routers.api.rule=Host(`${API_HOST}`)"
-      - "traefik.http.routers.api.entrypoints=web"
-      - "traefik.http.routers.api.middlewares=csrf-headers@file,secure-headers@file,rate-limit-api@file"
+      - "traefik.http.routers.api.entrypoints=web-secure"
+      # body-limit restores the nginx vhosts' 25 MB `client_max_body_size`,
+      # which has no Traefik default. It is on this router only -- see the
+      # streaming caveat in traefik/dynamic/middlewares.yml.
+      - "traefik.http.routers.api.middlewares=secure-headers@file,body-limit@file,rate-limit-api@file"
       - "traefik.http.services.web.loadbalancer.server.port=8000"
       # The drain-aware probe. Returns 503 while /tmp/drain exists, which is how
       # Plan 3 removes a replica from rotation BEFORE stopping it.
@@ -143,7 +161,7 @@ services:
       - "traefik.http.services.web.loadbalancer.healthcheck.status=200"
 
   worker:
-    image: ghcr.io/etqan-agency/chatbot/api:${IMAGE_TAG:-latest}
+    image: ghcr.io/etqan-agency/chatbot-zaychain/api:${IMAGE_TAG:-latest}
     restart: unless-stopped
     command: ["celery", "-A", "Conf", "worker", "-l", "info", "--concurrency", "2"]
     # Celery treats SIGTERM as a warm shutdown: finish the current task, stop
@@ -190,7 +208,7 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.media.rule=Host(`${API_HOST}`) && PathPrefix(`/media`)"
-      - "traefik.http.routers.media.entrypoints=web"
+      - "traefik.http.routers.media.entrypoints=web-secure"
       - "traefik.http.routers.media.middlewares=secure-headers@file,rate-limit-static@file"
       # Higher than the api router's default (which is the rule's length).
       # Without this, matching is by rule length and the outcome is incidental
@@ -199,7 +217,7 @@ services:
       - "traefik.http.services.media.loadbalancer.server.port=80"
 
   dashboard:
-    image: ghcr.io/etqan-agency/chatbot/dashboard:${IMAGE_TAG:-latest}
+    image: ghcr.io/etqan-agency/chatbot-zaychain/dashboard:${IMAGE_TAG:-latest}
     restart: unless-stopped
     depends_on:
       - web
@@ -209,7 +227,7 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.app.rule=Host(`${APP_HOST}`)"
-      - "traefik.http.routers.app.entrypoints=web"
+      - "traefik.http.routers.app.entrypoints=web-secure"
       - "traefik.http.routers.app.middlewares=secure-headers@file,rate-limit-static@file"
       - "traefik.http.services.dashboard.loadbalancer.server.port=80"
       - "traefik.http.services.dashboard.loadbalancer.healthcheck.path=/"

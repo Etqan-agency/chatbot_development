@@ -13,7 +13,7 @@ COPY celery /usr/local/bin/celery
 RUN chmod +x /usr/local/bin/celery /app/manage.py \
     && mkdir -p /app/staticfiles /app/media
 
-# Mirrors the real image's probe (chatbot_api/Dockerfile) in shape: same route,
+# Mirrors the real image's probe (chabot_dev_api/Dockerfile) in shape: same route,
 # same failure semantics. The intervals are compressed because a rehearsal that
 # waits 60s per container for a start_period it does not need is a rehearsal
 # nobody runs. wait_containers_healthy reads the verdict, not the timings.

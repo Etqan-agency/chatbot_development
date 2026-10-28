@@ -12,7 +12,7 @@ TRAEFIK_API="${TRAEFIK_API:-http://127.0.0.1:8080/api}"
 # after which a drained backend is certainly out of rotation.
 DRAIN_SETTLE_SECS="${DRAIN_SETTLE_SECS:-15}"
 # The api image's HEALTHCHECK declares start_period 60s and interval 10s
-# (chatbot_api/Dockerfile), so a cold web container needs ~70s before its first
+# (chabot_dev_api/Dockerfile), so a cold web container needs ~70s before its first
 # passing probe is recorded. Re-derive this from the Dockerfile, not from
 # memory: an earlier version of this comment said 40s/30s, which happens to sum
 # to the same 70s and so hid the drift.
@@ -102,21 +102,35 @@ traefik_backends_up() {
   | sed -n 's/.*"\(http:\/\/[^"]*\)":"\(UP\|DOWN\)".*/\1 \2/p'
 }
 
-# Assert every port the Traefik container publishes is bound to 127.0.0.1.
+# Assert the Traefik container publishes EXACTLY the two public ports, and
+# that neither is confined to loopback.
 #
-# The whole security model of this topology rests on that one binding: Traefik
-# terminates no TLS and writes no request log of its own, because both are the
-# host nginx's job in front of it (docs/DEPLOY.md §1). Publish it on 0.0.0.0
-# instead and the entire stack is served in cleartext to the internet.
+# Traefik is the edge on this topology: it terminates TLS and owns 80/443
+# directly, with no nginx in front (docs/DEPLOY.md §1). That makes three
+# distinct failure modes worth refusing a deploy over, and all three are
+# invisible to everything else the deploy does:
 #
-# Nothing else catches that. ufw cannot -- Docker inserts its own iptables
-# rules ahead of ufw's, so a 0.0.0.0-published container port is reachable
-# whether or not ufw has a matching rule. Nor can the smoke probes: all five
-# request 127.0.0.1:8081, which answers identically either way, so a wrongly
-# published gateway passes every check the deploy makes. Hence an explicit
-# assertion, in the preflight, before anything is mutated.
-assert_loopback_publication() {
-  local out rc line addr bad=0
+#   * 443 missing or bound to 127.0.0.1 -- the site is simply unreachable.
+#     Likely rather than exotic: this repository's history contains a
+#     `- "127.0.0.1:8081:80"` ports entry from the nginx topology, and an
+#     upstream merge that reinstates it produces exactly this.
+#
+#   * 80 missing or loopback-bound -- less obvious and much worse. Nothing
+#     user-facing breaks, because 80 only redirects. But the ACME http-01
+#     challenge is answered on :80, so certificate RENEWAL stops. The site
+#     keeps working for up to 60 days and then fails everywhere at once.
+#
+#   * anything else published -- the traefik entrypoint (8080) serves the
+#     entire routing configuration. It binds 127.0.0.1 inside the container's
+#     own namespace, so publishing it does not actually expose it today, but a
+#     ports entry for it means someone is trying to, and the next change that
+#     alters that entrypoint's address would land it on the internet.
+#
+# ufw does not cover any of this: Docker inserts its iptables rules ahead of
+# ufw's, so what is published is reachable regardless of ufw policy. Hence an
+# explicit assertion, in the preflight, before anything is mutated.
+assert_edge_publication() {
+  local out rc line cport addr bad=0 seen80=0 seen443=0
   out=$(docker port "$TRAEFIK_CONTAINER" 2>&1); rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "ERROR: could not read ${TRAEFIK_CONTAINER}'s published ports:" >&2
@@ -125,31 +139,66 @@ assert_loopback_publication() {
   fi
   if [ -z "$out" ]; then
     echo "ERROR: ${TRAEFIK_CONTAINER} publishes no ports at all." >&2
-    echo "       Expected the traefik service's \`ports:\` entry in" >&2
-    echo "       ${COMPOSE_FILE} to read \"127.0.0.1:8081:80\"." >&2
+    echo "       Traefik is the edge here: with nothing published it serves" >&2
+    echo "       nobody, and no certificate can be issued or renewed." >&2
+    _edge_publication_fix
     return 1
   fi
   while read -r line; do
     [ -n "$line" ] || continue
-    # A `docker port` line is "80/tcp -> 127.0.0.1:8081". Drop the mapping
-    # arrow, then the trailing :port, leaving the bind address.
+    # A `docker port` line is "80/tcp -> 0.0.0.0:80". The container port is to
+    # the left of the arrow, before the /proto; the bind address is to the
+    # right, before the trailing :port. IPv6 renders as "[::]:80", so strip
+    # from the LAST colon.
+    cport="${line%%/*}"
     addr="${line##* -> }"
     addr="${addr%:*}"
-    [ "$addr" = "127.0.0.1" ] && continue
-    echo "ERROR: ${TRAEFIK_CONTAINER} publishes ${line}" >&2
-    echo "       -- bound to ${addr}, not 127.0.0.1." >&2
-    bad=1
+    case "$cport" in
+      80|443)
+        if [ "$cport" = 80 ]; then seen80=1; else seen443=1; fi
+        # "[::]" and "0.0.0.0" are both public; only loopback is a fault.
+        if [ "$addr" = "127.0.0.1" ] || [ "$addr" = "[::1]" ]; then
+          echo "ERROR: ${TRAEFIK_CONTAINER} publishes ${line}" >&2
+          echo "       -- port ${cport} is bound to loopback, so it is not" >&2
+          echo "       reachable from off-host. This is the nginx topology's" >&2
+          echo "       ports entry; it does not apply here." >&2
+          bad=1
+        fi
+        ;;
+      *)
+        echo "ERROR: ${TRAEFIK_CONTAINER} publishes ${line}" >&2
+        echo "       -- container port ${cport} must not be published." >&2
+        bad=1
+        ;;
+    esac
   done <<<"$out"
+  if [ "$seen80" -eq 0 ]; then
+    echo "ERROR: ${TRAEFIK_CONTAINER} does not publish port 80." >&2
+    echo "       Nothing user-facing breaks immediately -- :80 only redirects" >&2
+    echo "       to https -- but the ACME http-01 challenge is answered there," >&2
+    echo "       so certificates stop RENEWING and the site fails in <= 60 days." >&2
+    bad=1
+  fi
+  if [ "$seen443" -eq 0 ]; then
+    echo "ERROR: ${TRAEFIK_CONTAINER} does not publish port 443." >&2
+    echo "       Traefik terminates TLS on this topology; without 443 there is" >&2
+    echo "       nothing serving https at all." >&2
+    bad=1
+  fi
   if [ "$bad" -ne 0 ]; then
-    echo "       The gateway is reachable over plain http from off-host," >&2
-    echo "       bypassing nginx's TLS and access log. Fix the traefik" >&2
-    echo "       service's \`ports:\` entry in ${COMPOSE_FILE} back to" >&2
-    echo "         - \"127.0.0.1:8081:80\"" >&2
-    echo "       then re-create the container:" >&2
-    echo "         docker compose -f ${COMPOSE_FILE} up -d --no-deps traefik" >&2
+    _edge_publication_fix
     return 1
   fi
   return 0
+}
+
+_edge_publication_fix() {
+  echo "       Fix the traefik service's \`ports:\` entry in ${COMPOSE_FILE}" >&2
+  echo "       to read exactly:" >&2
+  echo "         - \"80:80\"" >&2
+  echo "         - \"443:443\"" >&2
+  echo "       then re-create the container:" >&2
+  echo "         docker compose -f ${COMPOSE_FILE} up -d --no-deps traefik" >&2
 }
 
 # Refuse when the running gateway predates its own static configuration.
@@ -196,7 +245,7 @@ assert_gateway_config_applied() {
   started_epoch=$(date -d "$started" +%s 2>/dev/null)
   if [ -z "$started_epoch" ]; then
     # Do not block a deploy on an inability to check. A gateway that is absent
-    # or unreadable is already refused, loudly, by assert_loopback_publication.
+    # or unreadable is already refused, loudly, by assert_edge_publication.
     echo "WARNING: could not read ${TRAEFIK_CONTAINER}'s start time; skipping the" >&2
     echo "         static-configuration check." >&2
     return 0
@@ -286,7 +335,7 @@ wait_backends_settled() {
 # `docker stop` alone is NOT a drain: Traefik learns the container is gone from
 # the event stream, but requests dispatched in that same instant die with it.
 # A real drain needs the application to fail its own health probe first, and
-# only web has that -- chatbot_api/Conf/views.py returns 503 while
+# only web has that -- chabot_dev_api/Conf/views.py returns 503 while
 # settings.DRAIN_FILE exists. Hence the explicit `drainable` argument: this
 # function must never claim to drain a service that cannot be drained.
 #

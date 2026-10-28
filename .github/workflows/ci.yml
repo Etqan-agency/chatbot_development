@@ -16,7 +16,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   # Must be lowercase for the Docker registry.
-  IMAGE_PREFIX: etqan-agency/chatbot
+  IMAGE_PREFIX: etqan-agency/chatbot-zaychain
 
 jobs:
   changes:
@@ -41,9 +41,9 @@ jobs:
         with:
           filters: |
             api:
-              - 'chatbot_api'
+              - 'chabot_dev_api'
             dashboard:
-              - 'chatbot_dashboard'
+              - 'chabot_dev_dash'
             infra:
               - 'docker-compose.production.yml'
               - 'traefik/**'
@@ -66,7 +66,7 @@ jobs:
           python-version: '3.13'
       - run: pip install pre-commit
       - name: Run pre-commit
-        working-directory: chatbot_api
+        working-directory: chabot_dev_api
         run: pre-commit run --all-files
 
   api-test:
@@ -105,18 +105,18 @@ jobs:
         with:
           python-version: '3.13'
       - name: Install dependencies
-        working-directory: chatbot_api
+        working-directory: chabot_dev_api
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Check for missing migrations
-        working-directory: chatbot_api
+        working-directory: chabot_dev_api
         run: python manage.py makemigrations --check --dry-run
       - name: Run migrations
-        working-directory: chatbot_api
+        working-directory: chabot_dev_api
         run: python manage.py migrate --noinput
       - name: Run tests
-        working-directory: chatbot_api
+        working-directory: chabot_dev_api
         run: python manage.py test
 
   dashboard-checks:
@@ -133,18 +133,18 @@ jobs:
         with:
           node-version: '22'
           cache: 'npm'
-          cache-dependency-path: chatbot_dashboard/package-lock.json
+          cache-dependency-path: chabot_dev_dash/package-lock.json
       - name: Install dependencies
-        working-directory: chatbot_dashboard
+        working-directory: chabot_dev_dash
         run: npm ci
       - name: Lint
-        working-directory: chatbot_dashboard
+        working-directory: chabot_dev_dash
         run: npm run lint
       - name: Type check
-        working-directory: chatbot_dashboard
+        working-directory: chabot_dev_dash
         run: npx tsc --noEmit
       - name: Build
-        working-directory: chatbot_dashboard
+        working-directory: chabot_dev_dash
         run: npm run build
 
   infra-lint:
@@ -269,8 +269,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [changes]
     # Same gate as infra-lint and rollout-tests: this exercises the deploy
-    # scripts, the compose topology and the shipped vhosts, none of which an
-    # application-only change can affect.
+    # scripts, the compose topology and the gateway configuration, none of
+    # which an application-only change can affect.
     if: needs.changes.outputs.infra == 'true'
     # The rehearsal runs three rolls, each of which waits out a drain settle
     # window and two health gates. 25 minutes is roughly 3x the observed run
@@ -352,7 +352,7 @@ jobs:
             type=raw,value=latest
       - uses: docker/build-push-action@v6
         with:
-          context: ./chatbot_api
+          context: ./chabot_dev_api
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -392,7 +392,7 @@ jobs:
             type=raw,value=latest
       - uses: docker/build-push-action@v6
         with:
-          context: ./chatbot_dashboard
+          context: ./chabot_dev_dash
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

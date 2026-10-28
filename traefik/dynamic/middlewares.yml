@@ -1,29 +1,44 @@
 http:
   middlewares:
-    # Django builds absolute URLs and validates CSRF against the forwarded
-    # scheme. Behind TLS termination it would otherwise see plain http.
-    csrf-headers:
-      headers:
-        customRequestHeaders:
-          X-Forwarded-Proto: "https"
-
     secure-headers:
       headers:
         stsSeconds: 31536000
         stsIncludeSubdomains: true
         stsPreload: true
-        # Traefik emits Strict-Transport-Security only for a request it
-        # considers TLS -- and on this topology TLS terminates at the host
-        # nginx, so every request reaching Traefik is plain http on the
-        # loopback `web` entrypoint. Without this, the sts* settings above are
-        # silently inert and NO route gets HSTS. forceSTSHeader emits it
-        # regardless. The connection is still TLS end-to-end from the client's
-        # point of view: nginx is what the browser talks to.
-        forceSTSHeader: true
+        # There is deliberately NO `forceSTSHeader` here. Traefik emits
+        # Strict-Transport-Security only for a request it considers TLS, and
+        # on this topology it terminates TLS itself, so the sts* settings
+        # above apply natively.
+        #
+        # The previous topology needed forceSTSHeader because TLS ended at the
+        # host nginx and every request reaching Traefik was plain http on a
+        # loopback entrypoint -- without it the sts* settings were silently
+        # inert. Restoring it here is not merely redundant: it would emit HSTS
+        # on the :80 redirect response too, i.e. over cleartext, which is
+        # exactly what the spec says to ignore.
         frameDeny: true
         contentTypeNosniff: true
         browserXssFilter: true
         referrerPolicy: "strict-origin-when-cross-origin"
+
+    # Replaces the nginx vhosts' `client_max_body_size 25M`. Traefik imposes NO
+    # request body limit of its own, so without this middleware dropping the
+    # nginx layer silently turns a 25 MB ceiling into an unlimited one, and the
+    # first symptom is a worker OOM rather than a 413.
+    #
+    # 26214400 = 25 * 1024 * 1024, matching the old vhosts exactly.
+    #
+    # CAVEAT, and it is why this is applied to the api router only rather than
+    # globally: `buffering` reads the whole request body before forwarding it
+    # (spilling past memRequestBodyBytes to disk). nginx rejected an oversized
+    # body from the declared Content-Length without reading it. Streaming
+    # request bodies therefore behave differently here, and any route that
+    # streams a RESPONSE must be checked against this middleware before it is
+    # widened -- see docs/DEPLOY.md.
+    body-limit:
+      buffering:
+        maxRequestBodyBytes: 26214400
+        memRequestBodyBytes: 1048576
 
     # The API is called by tenants' own integrations as well as the dashboard,
     # so this is a coarse abuse guard only. Per-tenant limits are enforced in
@@ -34,29 +49,22 @@ http:
         average: 50
         burst: 100
         period: 1s
-        # Behind a proxy, the default source criterion is the connecting
-        # address -- which is nginx, for every request. That silently turns a
-        # per-client limit into one 50 req/s bucket shared by every tenant.
+        # There is deliberately NO `sourceCriterion` here, and adding one is a
+        # SECURITY change rather than a tuning knob. The default criterion is
+        # the connecting peer's real address, which on this topology is the
+        # client itself -- Traefik is the edge.
         #
-        # excludedIPs (not depth): walks X-Forwarded-For from the right and
-        # returns the first entry that is NOT one of these trusted-proxy
-        # addresses, so nginx's own hop (added by $proxy_add_x_forwarded_for)
-        # is skipped and a client cannot displace it by sending its own XFF.
-        # depth:1 would do the same on the happy path, but on ANY request that
-        # reaches Traefik without an X-Forwarded-For at all (misconfigured
-        # vhost, or something reaching this entrypoint without traversing
-        # nginx) depth yields an empty source and collapses every such
-        # request into one bucket -- silently, and permanently, since nothing
-        # about it looks like an error. excludedIPs degrades instead: with no
-        # XFF to walk, it falls back to the connecting peer (nginx), so
-        # degraded-path traffic buckets under nginx's own address rather than
-        # an empty one. Same trusted addresses as traefik.yml's
-        # forwardedHeaders.trustedIPs, so the two settings cannot disagree.
-        sourceCriterion:
-          ipStrategy:
-            excludedIPs:
-              - "127.0.0.1/32"
-              - "172.18.0.1/32"
+        # The previous topology set sourceCriterion.ipStrategy.excludedIPs to
+        # walk X-Forwarded-For and skip nginx's trusted hop. That was correct
+        # ONLY because a trusted proxy sat in front and rewrote the header.
+        # Here nothing does: X-Forwarded-For is whatever the caller chose to
+        # send. Restoring that block from git history would let any caller
+        # forge XFF to escape its own rate-limit bucket or poison another
+        # tenant's, with nothing in the logs naming a cause.
+        #
+        # This pairs with the absent forwardedHeaders.trustedIPs in
+        # traefik.yml. The two are ONE decision; changing either alone
+        # produces a configuration that looks deliberate and is wrong.
 
     # Static asset serving; the limit exists to blunt scrapers, not to shape
     # normal use.
@@ -65,11 +73,4 @@ http:
         average: 100
         burst: 200
         period: 1s
-        # See rate-limit-api's comment: excludedIPs, not depth, so a request
-        # missing X-Forwarded-For degrades to nginx's own bucket instead of
-        # collapsing into one shared empty-source bucket for everyone.
-        sourceCriterion:
-          ipStrategy:
-            excludedIPs:
-              - "127.0.0.1/32"
-              - "172.18.0.1/32"
+        # See rate-limit-api: no sourceCriterion, for the same reason.

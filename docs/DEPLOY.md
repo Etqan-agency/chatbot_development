@@ -5,42 +5,66 @@ decision below has been forgotten. It assumes no prior context: it names every
 file, secret and command it depends on.
 
 The stack is one Docker Compose project (`docker-compose.production.yml`,
-pinned `name: chatbot`), fronted by Traefik, fronted in turn by nginx on the
-same Ubuntu host (see §1 for the full request path). Deploys and rollbacks are
+pinned `name: chatbot`), fronted by Traefik, which is the public edge and
+terminates TLS itself (see §1 for the full request path). Deploys and rollbacks are
 driven from GitHub Actions, but the scripts they call
 (`scripts/deploy.sh`, `scripts/rollback.sh`, `scripts/sync-service-labels.sh`)
 are ordinary bash and can be run by hand on the server if Actions is
 unavailable.
 
+This repository deploys **one** environment to **one** host: the image path,
+the two public hostnames and the deploy target are each written in exactly one
+place and read as constants everywhere else. To stand up a second, independent
+client on its own host, see [`NEW-CLIENT.md`](NEW-CLIENT.md) — it lists the
+couplings a fork has to break, and then returns you here for §2 and §11.
+
 ## 1. Topology
 
-The request path has a hop in front of the Docker stack:
+There is nothing in front of the Docker stack:
 
 ```text
-client → nginx (host, :443, certbot TLS) → 127.0.0.1:8081 → Traefik → containers
+client → Traefik (:80 redirect, :443 TLS) → containers
 ```
 
-nginx runs directly on the host (not in Compose), owns `:80`/`:443`, and
-terminates TLS with certbot-issued certificates. It reverse-proxies everything
-to Traefik over loopback. Traefik **terminates nothing and requests no
-certificates of its own** — its one active entrypoint (`web`, plaintext
-`:80`) is published as `127.0.0.1:8081` only, so nothing outside the host can
-reach it directly. Its ACME configuration (`web-secure`, `certificatesResolvers`
-in `traefik/traefik.yml`) is kept in the file but dormant: no router names a
-`certresolver`, so Traefik never contacts Let's Encrypt. See §2 for why it's
-kept rather than deleted.
+**Traefik is the edge.** It owns `:80` and `:443` directly, terminates TLS
+itself, and obtains its own certificates from Let's Encrypt over HTTP-01. There
+is no nginx on the host and no certbot — the only nginx in this system is the
+`media` *container*, which serves `/media/` and is reached through Traefik like
+any other backend.
 
-This only changes what sits in front of Traefik. The load-balancer
-healthchecks that gate a rolling deploy (`web`'s drain-aware `/health/` probe,
-`dashboard`'s `/` probe) and the drain gate described in §4/§6 run
-Traefik→container, entirely behind nginx, and are unaffected by anything
-in front of Traefik.
+`:80` carries a blanket 301 to `:443` and nothing else. The ACME challenge is
+answered on that same entrypoint by a handler Traefik registers at a higher
+priority than the redirect, which is why the two coexist. `scripts/e2e.sh`
+asserts both halves on every run: a normal path must redirect, and
+`/.well-known/acme-challenge/` must not.
+
+**Certificates and deploys are completely decoupled from each other in the
+other direction now.** Under the previous topology a deploy could not affect
+TLS because certbot owned it. Here a deploy does not either — ACME state lives
+in the `traefik_acme` volume and survives container recreation — but a *gateway
+restart* is now a TLS event, not just a routing one. See §4.
+
+The load-balancer healthchecks that gate a rolling deploy (`web`'s drain-aware
+`/health/` probe, `dashboard`'s `/` probe) and the drain gate described in
+§4/§6 run Traefik→container over the internal network, and are unaffected by
+anything happening at the edge.
+
+> **Historical note for anyone reading git history or merging an upstream
+> branch.** This stack used to run `client → nginx (host, certbot TLS) →
+> 127.0.0.1:8081 → Traefik`. Several settings were *correct only under that
+> topology* and are actively dangerous if restored: `forwardedHeaders.trustedIPs`
+> in `traefik.yml`, `sourceCriterion.ipStrategy.excludedIPs` on the rate-limit
+> middlewares, the `csrf-headers` middleware, `forceSTSHeader`, and the
+> `- "127.0.0.1:8081:80"` ports entry. Each is commented at its own site with
+> the reason. The rate-limiter one is the dangerous one: with Traefik at the
+> edge, `X-Forwarded-For` is attacker-controlled, so keying the limiter off it
+> lets any caller forge its own bucket.
 
 Ten containers, five services never rolled and three rolled:
 
 | Service | Replicas | Rolled? | Role |
 |---|---|---|---|
-| `traefik` | 1 | no | Gateway: plaintext routing only. Reachable over loopback (`127.0.0.1:8081`); TLS terminates at nginx (host), not here |
+| `traefik` | 1 | no | Gateway and edge: owns `:80`/`:443`, terminates TLS, runs ACME |
 | `socket-proxy` | 1 | no | Read-only Docker socket proxy for Traefik's docker provider |
 | `db` | 1 | no | PostgreSQL (`pgvector/pgvector:pg16`) |
 | `redis` | 1 | no | Cache + Celery broker |
@@ -72,7 +96,7 @@ the server; nothing derives one from the other:
 
 ## 2. Provisioning a host
 
-Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-design.md`
+Spec: `chabot_dev_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-design.md`
 §7. Run these once, in order, before the first deploy.
 
 1. **Ubuntu 22.04+, 4 vCPU / 8 GB RAM, plus a swap file at least half of
@@ -96,25 +120,27 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
    sudo ufw allow 443
    sudo ufw enable
    ```
-   80 and 443 are for **nginx** — it is what listens on `0.0.0.0`. Traefik
-   needs no firewall rule of its own: it is published as `127.0.0.1:8081`
-   (see §1), which is not reachable from outside the host regardless of what
-   ufw allows.
+   80 and 443 are Traefik's — it is what listens on `0.0.0.0`, and both are
+   required. 443 is obvious; **80 is the one people close**, and closing it
+   breaks nothing visible because every real client is already on https. What
+   it breaks is the ACME HTTP-01 challenge, so certificates stop renewing and
+   the site fails everywhere at once up to 60 days later.
 
-   **Loopback binding is the control here, not the firewall.** Docker inserts
+   **Note that ufw is not actually what is controlling this.** Docker inserts
    its own iptables `DOCKER-USER`/`DOCKER` chain rules ahead of ufw's, so a
-   container port published on `0.0.0.0` is reachable from the network
-   whether or not ufw has a matching `allow` rule — ufw simply never gets a
-   say for Docker-published ports. If Traefik's port publication in
-   `docker-compose.production.yml` were ever changed from
-   `127.0.0.1:8081:80` to `8081:80` (or `0.0.0.0:8081:80`), the whole stack
-   would become reachable over plain HTTP on 8081, bypassing nginx's TLS and
-   its access log, and ufw would not stop it. (Rate limiting is *not* among
-   the losses: it is Traefik's, in `traefik/dynamic/middlewares.yml`, and is
-   applied on the 8081 path itself.) `deploy.sh`'s preflight asserts every
-   published Traefik mapping is on `127.0.0.1` and refuses otherwise, so a
-   deploy cannot proceed against a wrongly-published gateway — but a manual
-   `docker compose up -d` still can, which is why §11 also checks it.
+   container port published on `0.0.0.0` is reachable from the network whether
+   or not ufw has a matching `allow` rule — ufw never gets a say for
+   Docker-published ports. The `allow` lines above are therefore documentation
+   of intent rather than enforcement, and adding or removing a rule for 80/443
+   changes nothing. Conversely, **do not rely on ufw to close a port Docker
+   publishes**: the only way to stop publishing something is to remove it from
+   the `ports:` entry.
+
+   `deploy.sh`'s preflight (`assert_edge_publication`) asserts that Traefik
+   publishes exactly 80 and 443, that neither is confined to loopback, and that
+   nothing else is published at all — and refuses the deploy otherwise. A
+   manual `docker compose up -d` bypasses that, which is why §11 checks it
+   too.
 
 4. **Create the `deploy` user and add it to the `docker` group:**
    ```bash
@@ -142,138 +168,73 @@ Spec: `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-des
    `deploy.sh` reads it as the authoritative source for `API_HOST`, `APP_HOST`
    and everything else.
 
-7. **Install nginx, then the two vhosts, then certbot — before the first
-   deploy, and independent of it.** With the gateway split (§1), certificates
-   are decoupled from deploys entirely: nothing in `deploy.sh` talks to Let's
-   Encrypt, so this step has no deadline relative to CD, only relative to DNS.
+7. **Create A records for both hostnames, pointing at this host — before the
+   first bring-up, not after it.**
 
-   - **DNS A and AAAA records for both `api.chatbot-demo.etqanbackend.tech` and
-     `app.chatbot-demo.etqanbackend.tech`, pointing at this host, must exist
-     before certbot runs** (not before the first deploy — see above). certbot
-     uses the same HTTP-01 challenge Traefik's dormant resolver would have
-     used: it resolves the hostname over the public internet to validate
-     ownership, so a missing record fails the request for that host outright.
-   - Install nginx (`sudo apt install nginx`), then copy the two reference
-     vhosts from `docs/nginx/` into `/etc/nginx/sites-available/` and enable
-     them:
-     ```bash
-     sudo cp docs/nginx/api.chatbot-demo.conf \
-       /etc/nginx/sites-available/api.chatbot-demo.etqanbackend.tech
-     sudo cp docs/nginx/app.chatbot-demo.conf \
-       /etc/nginx/sites-available/app.chatbot-demo.etqanbackend.tech
-     sudo ln -s /etc/nginx/sites-available/api.chatbot-demo.etqanbackend.tech \
-       /etc/nginx/sites-enabled/
-     sudo ln -s /etc/nginx/sites-available/app.chatbot-demo.etqanbackend.tech \
-       /etc/nginx/sites-enabled/
-     sudo nginx -t && sudo systemctl reload nginx
-     ```
-     **The files under `/etc/nginx/sites-available/` are the live vhosts.
-     `docs/nginx/*.conf` are reference copies only — CD cannot deploy them**
-     (they live outside `DEPLOY_PATH` and are root-owned, unlike everything
-     else CD syncs). **The two are kept in sync by hand.** If either vhost is
-     changed — a header, a timeout, a body-size limit — copy the change into
-     both places yourself; nothing else does it for you.
+   There is no nginx to install, no vhost to copy, and no certbot to run.
+   Traefik requests certificates itself, on demand, the first time a TLS
+   handshake arrives for a hostname one of its routers claims. That makes DNS a
+   hard precondition of the *first bring-up* (§2.8) rather than of a separate
+   certificate step.
 
-     `deploy.sh` reports any disagreement on every deploy, and
-     `bash scripts/check-vhost-drift.sh` gives the same answer on demand with a
-     non-zero exit. It compares behaviour, not bytes: where traffic is proxied,
-     which hostnames and ports are answered, the upload ceiling, the proxy
-     timeouts and the forwarded headers. TLS plumbing and comments are ignored,
-     because those differ legitimately between a host that has run
-     `certbot --nginx` and one that has only ever run `certonly --webroot`.
+   ```bash
+   dig +short <API_HOST>
+   dig +short <APP_HOST>
+   ```
+   Both must return this host's IP, and `:80` must be reachable from the public
+   internet, before the stack comes up — Traefik answers the HTTP-01 challenge
+   there itself.
 
-     **The shipped vhosts contain a `:80` server block only** — no `listen
-     443`, no `ssl_certificate`. That is deliberate and must stay that way
-     until certbot has run. A `listen 443 ssl` block whose certificate lines
-     are commented out is not a valid configuration: nginx fails the whole
-     config with `no "ssl_certificate" is defined for the "listen ... ssl"
-     directive`. With the symlinks already live, that failure means nginx
-     **refuses to start at all** on the next `systemctl restart` (a reboot, an
-     apt upgrade), taking `:80` and `:443` down for *every* site on this host.
-     certbot cannot rescue it either — it runs `nginx -t` itself first.
-   - **Obtain the certificates with `certonly --webroot`, not `--nginx`:**
-     ```bash
-     sudo certbot certonly --webroot -w /var/www/html \
-       -d api.chatbot-demo.etqanbackend.tech
-     sudo certbot certonly --webroot -w /var/www/html \
-       -d app.chatbot-demo.etqanbackend.tech
-     ```
-     **Do not use `certbot --nginx` here.** The nginx plugin does not create a
-     second server block: with only a `:80` server present it *appends*
-     `listen 443 ssl` and the certificate lines to that same block. The `:80`
-     `location /` redirect then applies to https as well, and every https
-     request 301s to itself — an infinite redirect loop on both hostnames.
-     That is measured behaviour on this stack, not a theoretical risk.
+   **Getting this wrong is not a quick retry.** Let'''s Encrypt'''s production CA
+   allows **5 failed authorisations per account, per hostname, per hour**. A
+   stack brought up against a hostname that does not resolve yet burns that in
+   one sitting, and then cannot obtain a certificate for the rest of the hour
+   even once DNS is correct. If there is any doubt, rehearse against staging
+   first by adding one line under `acme:` in `traefik/traefik.yml`:
 
-     `certonly --webroot` writes no nginx configuration at all. It answers the
-     HTTP-01 challenge through the `location /.well-known/acme-challenge/`
-     already in the `:80` block, which is also what keeps renewals working:
-     certbot's systemd timer (`certbot.timer`) reuses the webroot authenticator
-     recorded in `/etc/letsencrypt/renewal/<host>.conf`. There is no Traefik
-     involvement in issuance or renewal.
+   ```yaml
+   caServer: https://acme-staging-v02.api.letsencrypt.org/directory
+   ```
 
-     Note the redirect is written as `location / { return 301 ... }` rather
-     than a server-level `return 301`: a server-level return runs in nginx's
-     rewrite phase, *before* location matching, and would swallow the challenge
-     — every renewal would then fail.
-   - **Uncomment the `:443` block in each vhost.** Both files ship it commented
-     out below the `:80` server. It carries `client_max_body_size 25M`, the two
-     `120s` proxy timeouts, the `ssl_certificate` lines, the TLS settings and
-     the `location /` `proxy_pass` to `127.0.0.1:8081` — none of which exist
-     until you uncomment them, and without which the vhost terminates TLS and
-     then serves nothing.
+   Bring the stack up, confirm a certificate is issued — it will be untrusted
+   in a browser, which is the expected result — then remove the line and
+   recreate the gateway.
 
-     The TLS settings are written out **inline** rather than pulled in with
-     `include /etc/letsencrypt/options-ssl-nginx.conf` and `ssl_dhparam
-     /etc/letsencrypt/ssl-dhparams.pem`, which is what these files used to do.
-     Both of those are written into `/etc/letsencrypt` by certbot's *nginx
-     installer* plugin, and `certonly --webroot` runs no installer — that is
-     the entire reason the previous step uses it. On a host that has never run
-     `certbot --nginx` neither file exists, and `include`ing a missing file is
-     a hard `nginx -t` failure at this exact step. If you are adopting an
-     existing host, confirm before assuming either way:
-     ```bash
-     ls -l /etc/letsencrypt/options-ssl-nginx.conf /etc/letsencrypt/ssl-dhparams.pem
-     ```
+   **Check it actually landed before trusting it**, anchored to the config key
+   rather than the word, because `traefik.yml` mentions `caServer:` in a comment
+   too and a bare `grep` matches that:
 
-     It uses `listen 443 ssl http2`, not the standalone `http2 on;` directive:
-     that form requires nginx >= 1.25, and on 1.24 nginx rejects the entire
-     configuration with `unknown directive "http2"`.
+   ```bash
+   grep -E '^\s+caServer:' traefik/traefik.yml
+   ```
 
-     ```bash
-     sudo nginx -t && sudo systemctl reload nginx
-     ```
-     Verify before moving on — the loop above is invisible to `nginx -t`:
-     ```bash
-     curl -sS -o /dev/null -L --max-redirs 3 \
-       -w 'code=%{http_code} redirects=%{num_redirects}\n' \
-       https://api.chatbot-demo.etqanbackend.tech/
-     ```
-     Expect `redirects=0`. A `curl: (47) Maximum (3) redirects followed` means
-     the `:80` and `:443` blocks have been merged into one server.
+   No output means you are on the production CA, whatever the file appears to
+   say.
 
-   - **Do not add IPv6 listeners without checking every other vhost on the
-     host.** nginx makes the *first* server block on an `address:port` the
-     default server for that address, and `sites-enabled/` is read
-     alphabetically. Adding `listen [::]:80` to a vhost whose name sorts early,
-     on a host where the other sites' vhosts are IPv4-only, silently makes it
-     the default server for **all** IPv6 traffic — including ACME challenges
-     for those other sites, which then 404. Let's Encrypt does not retry over
-     IPv4 after a 404 (it is a valid HTTP response), so the co-hosted site's
-     certificate stops renewing and nothing reports it until expiry. That
-     happened during this host's provisioning and broke `etqanbackend.tech`'s
-     renewal; `nginx -t` is blind to it. The shipped vhosts are IPv4-only
-     because these hostnames have no AAAA records. If they gain them, add the
-     IPv6 listener to *every* vhost on the host at once.
-   - **Prove renewal works before walking away** — for every certificate on the
-     host, not just the new ones:
-     ```bash
-     sudo certbot renew --dry-run
-     ```
-     Expect `Congratulations, all simulated renewals succeeded` and one
-     `(success)` line per certificate. This is the only check that exercises
-     the challenge path end to end, and a renewal that fails here fails
-     silently in 60 days.
+
+   ```bash
+   docker compose -f docker-compose.production.yml up -d --no-deps --force-recreate traefik
+   ```
+
+   Staging'''s limits are far more generous and share nothing with production'''s.
+   (`scripts/e2e.sh` does the same substitution against a dead local address, so
+   a rehearsal never contacts either CA.)
+
+   **Certificates live in the `traefik_acme` volume**, which is what makes them
+   survive container recreation and every deploy. `docker compose down -v`
+   destroys that volume, and re-issuing counts against the rate limit above —
+   so never pass `-v` on a host that is serving.
+
+   **Renewal needs no timer and no cron.** Traefik renews in the background
+   from the same volume, using the same HTTP-01 challenge on `:80`. That is the
+   entire reason `:80` must stay published and reachable forever (§2.3), long
+   after every real client has moved to https.
+
+   **IPv6:** the shipped configuration assumes these hostnames have A records
+   only. Let'''s Encrypt prefers AAAA when one exists, so publishing an AAAA
+   record for a host that does not actually answer on `:80` over IPv6 makes
+   validation fail — add the record and confirm reachability together, or
+   neither.
 
 8. **Bring the stack up once by hand, before any CD run:**
    ```bash
@@ -386,35 +347,57 @@ see which stage it stopped at before assuming anything was rolled back.
 
 ### The five smoke probes
 
-`smoke_probes` (`scripts/lib/services.sh`) emits five checks, not three — the
-last two exist specifically to tell a broken release apart from a broken
-gateway:
+`smoke_probes` (`scripts/lib/services.sh`) emits five checks, in two groups.
+One definition serves both `deploy.sh` and `rollback.sh`, so a rollback can
+never verify less than the deploy gated on.
 
-1. `https://<API_HOST>/health/` — public, through nginx and Traefik.
-2. `https://<APP_HOST>/` — public, through nginx and Traefik.
-3. `https://<API_HOST>/media/<probe path>` — public, through nginx, Traefik
-   and the `media` service; the only probe that exercises the priority router
-   and the shared volume mount.
-4. `http://127.0.0.1:8081/health/` with an explicit `Host: <API_HOST>` header
-   — straight at Traefik's loopback port, bypassing nginx entirely.
-5. `http://127.0.0.1:8081/` with an explicit `Host: <APP_HOST>` header — same,
-   for the dashboard.
+**Three public https probes, expecting 200:**
 
-Probes 4 and 5 have to carry the `Host` header themselves because they are
-not going through nginx, which is what would normally supply it from the
-public hostname — Traefik's routers match on `Host(...)`, so a request
-without one falls through to no router at all.
+1. `https://<API_HOST>/health/` — the API through Traefik.
+2. `https://<APP_HOST>/` — the dashboard through Traefik.
+3. `https://<API_HOST>/media/<probe path>` — through Traefik and the `media`
+   service; the only probe that exercises the priority router and the shared
+   volume mount.
 
-Read the two probe layers together:
+**Two cleartext `:80` probes, expecting 301** — `http://127.0.0.1/health/` and
+`http://127.0.0.1/`, each with an explicit `Host:` header (Traefik's routers
+match on `Host(...)`, and a request without one falls through to no router at
+all).
 
-| Public | Loopback | Means |
+**301 is the pass for these, not 200.** They replaced the old
+"bypass nginx and hit Traefik directly" probes, which existed to tell a gateway
+fault apart from a bad release. There is no second layer to bypass now, so
+there is nothing to discriminate: if Traefik is broken the application is
+unreachable regardless.
+
+What they catch instead is the failure that is *now* the silent one. If `:80`
+stops answering, nothing user-facing breaks — every real client is already on
+https — but the ACME challenge is answered there, so **certificate renewal
+dies and the site fails everywhere at once up to 60 days later**. A deploy that
+checked only https would report success every time, right up to the expiry.
+
+So read a failure this way:
+
+| https | `:80` | Means |
 |---|---|---|
-| fail | pass | The application is healthy. The fault is nginx, certbot or DNS. `deploy.sh` will still have rolled back — re-deploy after fixing the gateway. |
-| fail | fail | The release is bad. The auto-rollback was correct. |
-| pass | fail | Should be impossible; nginx is proxying somewhere other than `127.0.0.1:8081`. |
+| pass | fail | Everything is serving, and renewal is broken. Nothing will look wrong until the certificate expires. Fix before that. |
+| fail | pass | Traefik is up and routing, but the TLS entrypoint or the certificate is not working. Check the gateway logs for ACME errors. |
+| fail | fail | The release is bad, or Traefik is down. The auto-rollback was correct. |
 
-(pass/pass is the fifth, unlisted combination: everything is healthy, nothing
-to do.)
+(pass/pass is the fourth, unlisted combination: everything is healthy.)
+
+### A gateway restart is now a TLS event
+
+Under the old topology, restarting Traefik moved routing only — nginx held TLS
+and clients saw nothing. Traefik now terminates TLS itself, so
+`up -d --no-deps --force-recreate traefik` drops every in-flight connection at
+the edge rather than just re-reading routes.
+
+It is still brief and still safe: certificates come back from the `traefik_acme`
+volume, not from Let'''s Encrypt, so a restart neither re-issues anything nor
+touches the rate limit. But it is no longer invisible, and it should not be
+done casually during traffic.
+
 
 ## 5. Rolling back
 
@@ -696,49 +679,54 @@ be read as covering it.
   routing dashboard→API traffic through Traefik instead of directly to `web`
   over Docker DNS — is not done and is not currently scheduled.
 
-- **`SECURE_SSL_REDIRECT` must stay `False`** in the server's `.env`. nginx
-  terminates TLS at the edge (§1); Traefik and `web` only ever see plain HTTP,
-  including for Traefik's own health probes. If `SECURE_SSL_REDIRECT` were
-  `True`, Django would answer every plain-HTTP request — including Traefik's
-  own probe of `/health/` — with a 301 redirect to HTTPS. Traefik's
-  `healthcheck.status=200` label reads anything other than exactly 200 as
-  unhealthy, so every `web` backend would drop out of rotation and the API
-  would 503 across the board. This is off deliberately: the HTTPS redirect is
-  nginx's job (its `:80` server block, per `docs/nginx/*.conf`), not
-  Django's or Traefik's, on this topology.
+- **`SECURE_SSL_REDIRECT` must stay `False`** in the server's `.env`. Traefik
+  terminates TLS at the edge (§1) and forwards to `web` over plain HTTP —
+  including for its own load-balancer health probes, which carry no
+  `X-Forwarded-Proto` at all. If `SECURE_SSL_REDIRECT` were `True`, Django
+  would answer every such request — including the probe of `/health/` — with a
+  301 to https. Traefik's `healthcheck.status=200` label reads anything other
+  than exactly 200 as unhealthy, so every `web` backend would drop out of
+  rotation and the API would 503 across the board. The https redirect is the
+  `web` entrypoint's job (§1), not Django's.
 
-- **A second proxy hop.** nginx's `client_max_body_size` and
-  `proxy_read_timeout` (`docs/nginx/*.conf`, both `25M`/`120s`) must stay at
-  or above the dashboard's own internal nginx (also `25M`/`120s`) or a request
-  that the dashboard's nginx would have allowed fails one hop earlier, at the
-  host vhost, before it ever reaches Traefik or `web`. **`scripts/check-vhost-drift.sh` now
-  compares the repository's reference copies against the live vhosts** and
-  `deploy.sh` runs it on every deploy, so a value edited on the server and
-  never brought back is reported rather than silently kept. It warns instead
-  of refusing: unlike stale Traefik static config, a drifted vhost does not
-  make the deploy itself dishonest, and blocking on it would put a
-  documentation reconciliation in the path of an urgent release. What it still
-  does **not** check is that these values stay at or above the dashboard's own
-  internal nginx — that pairing is a judgement, not an equality.
+- **Request-size and timeout ceilings now live in Traefik, not in a host
+  vhost.** The `body-limit` middleware's `maxRequestBodyBytes` (25 MB) and the
+  `web-secure` entrypoint's `respondingTimeouts` (120s) carry the values the
+  host nginx used to. Both must stay at or above the dashboard's own internal
+  nginx (`25M`/`120s`) or a request the dashboard would have allowed fails one
+  hop earlier, at the edge, before it reaches `web`.
 
-- **HSTS is set in exactly one place, and only because of one setting**:
-  Traefik's `secure-headers` middleware (`traefik/dynamic/middlewares.yml`).
-  The host nginx vhosts deliberately omit `Strict-Transport-Security`, so if a
-  future nginx change adds it there too, clients receive the header twice —
-  harmless in most clients but worth knowing before debugging a doubled header
-  in a response inspector.
+  This pairing is **not** checked by anything — it is a judgement, not an
+  equality. What *has* gone away is the drift problem: these values are in
+  `traefik/` and the compose labels, which CD syncs on every deploy, so they
+  can no longer be edited on the server and silently kept.
 
-  The load-bearing setting is **`forceSTSHeader: true`**. Traefik emits
-  `Strict-Transport-Security` only for a request it considers TLS; with TLS
-  terminating at the host nginx, every request Traefik sees arrives plain
-  http on the loopback `web` entrypoint, and the `stsSeconds` /
-  `stsIncludeSubdomains` / `stsPreload` settings beside it are inert without
-  it — no route gets HSTS at all, silently. `X-Forwarded-Proto: https` does
-  not change this. Django is not a fallback either: `SECURE_HSTS_SECONDS`
-  defaults to `0`. Verify with:
+  One behavioural difference from nginx worth knowing: `buffering` reads the
+  whole request body before forwarding it, whereas nginx rejected an oversized
+  body from its declared `Content-Length` without reading it. `body-limit` is
+  therefore applied to the `api` router only, and any route that streams should
+  be checked against it before that is widened.
+
+- **HSTS is set in exactly one place**: Traefik's `secure-headers` middleware
+  (`traefik/dynamic/middlewares.yml`). With the host nginx gone there is no
+  second emitter, so the doubled-header case that used to be possible here no
+  longer is. See the `forceSTSHeader` note above for the setting that must
+  *not* come back.
+
+  HSTS now works through the plain `stsSeconds` / `stsIncludeSubdomains` /
+  `stsPreload` settings, because Traefik terminates TLS itself and therefore
+  considers these requests TLS.
+
+  **`forceSTSHeader` has been removed, and must not be restored.** It existed
+  only because TLS used to terminate at the host nginx, leaving every request
+  Traefik saw as plain http on a loopback entrypoint — without it the `sts*`
+  settings were silently inert. Under this topology it is not merely redundant:
+  it would emit HSTS on the `:80` redirect response, i.e. over cleartext, which
+  the spec says clients must ignore. Django is not a fallback either:
+  `SECURE_HSTS_SECONDS` defaults to `0`. Verify against the real edge:
 
   ```bash
-  curl -sI -H 'Host: <APP_HOST>' http://127.0.0.1:8081/ | grep -i strict
+  curl -sI https://<APP_HOST>/ | grep -i strict
   ```
 
   If that returns nothing, HSTS is off everywhere.
@@ -866,39 +854,60 @@ Tick these off once, before the very first real deploy against this host:
    dig +short app.chatbot-demo.etqanbackend.tech
    ```
    both return this host's IP.
-2. **certbot lists both certificates with a future expiry:**
+2. **Traefik has actually obtained a certificate for both hostnames:**
    ```bash
-   sudo certbot certificates
+   docker exec chatbot-traefik-1 \
+     wget -qO- http://127.0.0.1:8080/api/http/routers | tr ',' '\n' | grep -i tls
    ```
-   shows both `api.chatbot-demo.etqanbackend.tech` and
-   `app.chatbot-demo.etqanbackend.tech`, each with an `Expiry Date` in the
-   future. If either is missing, certbot has not been run for that host yet
-   (§2, step 7) — recheck DNS before retrying.
-3. **The certificate nginx actually serves is real, not self-signed or
-   expired:**
+   There is no `certbot certificates` to run any more — issuance is Traefik's,
+   and the state lives in the `traefik_acme` volume. The authoritative check is
+   step 3 below; this one is for reading the gateway's own view when step 3
+   fails.
+
+   If no certificate was issued, the reason is almost always in the gateway
+   log:
+   ```bash
+   docker logs chatbot-traefik-1 2>&1 | grep -i acme
+   ```
+   A rate-limit message there means §2.7's five-failures-per-hour limit has
+   already been spent — fix DNS first, then wait it out. Retrying immediately
+   only spends the next hour's.
+
+3. **The certificate actually served is real, not Traefik's self-signed
+   default:**
    ```bash
    curl -sI https://api.chatbot-demo.etqanbackend.tech/health/
    ```
-   returns `HTTP/2 200` (or `HTTP/1.1 200`) with no certificate warning. A
-   `curl` certificate complaint here means nginx is not yet serving the
-   certbot certificate for this vhost, even if step 2 lists it — check that
-   `/etc/nginx/sites-enabled/` has the symlink and that `nginx -t` is clean.
-4. **Traefik's loopback port is not reachable from outside the host:**
-   ```bash
-   ss -ltnp | grep 8081
-   ```
-   shows the listener bound to `127.0.0.1:8081`, not `0.0.0.0:8081` or
-   `:::8081`. This is the check for the failure mode described in §2, step 3
-   — a `0.0.0.0` binding here bypasses nginx entirely and ufw will not stop
-   it.
+   returns `HTTP/2 200` (or `HTTP/1.1 200`) with no certificate warning.
 
-   Every subsequent deploy re-checks this on its own:
-   `deploy.sh`'s preflight runs `docker port chatbot-traefik-1` and refuses,
-   before any mutation, unless every published mapping is on `127.0.0.1`. So
-   this step is a first-deploy confirmation rather than the only guard — but
-   it is still worth running by hand after any change made outside a deploy
-   (a hand-run `docker compose up -d`, an edit to the compose file applied
-   directly), because nothing checks that path.
+   **A `curl` certificate complaint here is the expected symptom of a failed
+   ACME order**, not a separate fault: Traefik serves a self-signed certificate
+   of its own for any host it has no real one for, so the port answers and the
+   handshake completes — it is just untrusted. Do not read "the site loads with
+   a warning" as "TLS is nearly working"; it means no certificate was ever
+   issued. Go back to step 2.
+
+4. **Traefik publishes both public ports, and nothing else:**
+   ```bash
+   docker port chatbot-traefik-1
+   ```
+   shows exactly `80/tcp -> 0.0.0.0:80` and `443/tcp -> 0.0.0.0:443` (IPv6
+   `[::]` forms are equally fine). Three things are being checked at once:
+
+   - **443 present and not loopback-bound** — otherwise nothing serves https.
+   - **80 present and not loopback-bound** — nothing user-facing breaks if this
+     is wrong, but certificate renewal stops and the site fails up to 60 days
+     later. This is the one to be careful about.
+   - **nothing else published** — the `traefik` API entrypoint serves the whole
+     routing configuration.
+
+   Every subsequent deploy re-checks this on its own: `deploy.sh`'s preflight
+   (`assert_edge_publication`) runs the same `docker port` and refuses, before
+   any mutation, unless all three hold. So this step is a first-deploy
+   confirmation rather than the only guard — but it is still worth running by
+   hand after any change made outside a deploy (a hand-run
+   `docker compose up -d`, an edit to the compose file applied directly),
+   because nothing checks that path.
 5. **Traefik has registered both `web` backends as UP:**
    ```bash
    docker exec chatbot-traefik-1 wget -qO- http://127.0.0.1:8080/api/http/services/web@docker

@@ -15,7 +15,7 @@ RUN printf 'map $host $e2e_release { default "%s"; }\n' "${RELEASE}" \
       > /etc/nginx/conf.d/00-release.conf \
     && printf 'dashboard %s\n' "${RELEASE}" > /usr/share/nginx/html/index.html
 
-# The real dashboard image declares a HEALTHCHECK (chatbot_dashboard/
+# The real dashboard image declares a HEALTHCHECK (chabot_dev_dash/
 # Dockerfile), and wait_containers_healthy is only a real gate for services
 # whose image has one -- without it container_health reports "none:running"
 # the instant the container starts and the roll proceeds against a container

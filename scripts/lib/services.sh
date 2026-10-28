@@ -16,7 +16,7 @@
 #   drainable     whether the app has a drain-aware health route -- one that
 #                 returns 503 while DRAIN_FILE exists, so Traefik pulls the
 #                 replica from rotation before it is stopped. Only web does:
-#                 chatbot_api/Conf/views.py's `health`. A service marked true
+#                 chabot_dev_api/Conf/views.py's `health`. A service marked true
 #                 here MUST have that route in the image being deployed, or
 #                 retire_container waits out the settle window against a probe
 #                 that never fails and the stop is as abrupt as before.
@@ -97,23 +97,29 @@ release_current() {
 # silently regressed when the all-in-one nginx was replaced.
 smoke_probes() {
   local api_host="$1" app_host="$2" media_path="$3"
-  local gateway="${4:-http://127.0.0.1:8081}"
+  local gateway="${4:-http://127.0.0.1}"
   printf '%s\n' \
     "https://${api_host}/health/|200" \
     "https://${app_host}/|200" \
     "https://${api_host}/media/${media_path}|200"
-  # The same two routes again, but straight at Traefik's loopback port with an
-  # explicit Host header, bypassing nginx entirely.
+  # The http->https redirect, probed on the host's own :80 with an explicit
+  # Host header. 301 is the PASS here, not a failure.
   #
-  # Without these, an nginx misconfiguration and a broken release are the same
-  # observation: the public probes fail, deploy.sh auto-rolls-back, and a
-  # perfectly good image is reverted for a fault one layer above it. With them,
-  # public-fails + loopback-passes says "the application is fine, fix the
-  # gateway" -- which is not a conclusion the operator should have to derive
-  # under pressure.
+  # These replace the old "bypass nginx and hit Traefik directly" probes, which
+  # existed to tell an nginx fault apart from a broken release. There is no
+  # second layer to bypass any more -- Traefik is the edge, so if it is broken
+  # the application is unreachable regardless and there is nothing to
+  # discriminate.
+  #
+  # What these catch instead is the failure that is now the silent one: :80
+  # not answering. Nothing user-facing breaks when it stops, because every real
+  # client is already on https -- but the ACME http-01 challenge is answered
+  # there, so certificate renewal dies and the site fails everywhere at once up
+  # to 60 days later. A deploy that checked only https would report success
+  # every time right up to the expiry.
   printf '%s\n' \
-    "${gateway}/health/|200|${api_host}" \
-    "${gateway}/|200|${app_host}"
+    "${gateway}/health/|301|${api_host}" \
+    "${gateway}/|301|${app_host}"
 }
 
 # `media` is deliberately absent. It is a single replica serving a read-only

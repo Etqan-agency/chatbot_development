@@ -5,8 +5,8 @@ components are git submodules that keep their own history and their own `main`.
 
 ```
 chatbot/
-├── chatbot_api/          → submodule: Etqan-agency/chatbot_api (Django 5.2 + DRF)
-├── chatbot_dashboard/    → submodule: Etqan-agency/chatbot_dashboard (Vite + React 19)
+├── chabot_dev_api/          → submodule: Etqan-agency/chabot_dev_api (Django 5.2 + DRF)
+├── chabot_dev_dash/    → submodule: Etqan-agency/chabot_dev_dash (Vite + React 19)
 ├── traefik/              → Traefik v3 static config (traefik.yml) and dynamic
 │                           middlewares (traefik/dynamic/middlewares.yml) --
 │                           pending merge via the open gateway/compose PR
@@ -23,7 +23,7 @@ chatbot/
 ## Clone
 
 ```bash
-git clone --recurse-submodules git@github.com:Etqan-agency/chatbot.git
+git clone --recurse-submodules git@github.com:Etqan-agency/chatbot-zaychain.git
 # already cloned?
 git submodule update --init --recursive
 ```
@@ -44,8 +44,8 @@ Sub-project 1 of 4 (**component readiness**) is complete and under review on the
 
 The design and plan documents live in the API submodule:
 
-- `chatbot_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-design.md`
-- `chatbot_api/docs/superpowers/plans/2026-09-03-component-readiness.md`
+- `chabot_dev_api/docs/superpowers/specs/2026-09-03-infrastructure-pipeline-design.md`
+- `chabot_dev_api/docs/superpowers/plans/2026-09-03-component-readiness.md`
 
 ## Operations
 
@@ -67,8 +67,8 @@ that the compose file must honour:
    dashboard's nginx forwards `Host: app.<domain>`, and a bare apex does not cover
    subdomains — otherwise Django answers 400 to every proxied API request.
 
-Each component now has its own `sync-to-meta.yml` workflow (in `chatbot_api` and
-`chatbot_dashboard`, not in this repo): pushing to a component's `main` bumps that
+Each component now has its own `sync-to-meta.yml` workflow (in `chabot_dev_api` and
+`chabot_dev_dash`, not in this repo): pushing to a component's `main` bumps that
 component's submodule pointer here on a shared `release/next` branch and opens or
 updates a single "Release: submodule pointer updates" PR. Merging that PR into
 `main` is intended to be the deploy decision, since a commit on `main` always

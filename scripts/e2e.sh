@@ -6,21 +6,32 @@
 # WHAT IS REAL HERE, and why that is the point:
 #
 #   real: docker-compose.production.yml, traefik/traefik.yml,
-#         traefik/dynamic/middlewares.yml, media/nginx.conf, docs/nginx/*.conf,
+#         traefik/dynamic/middlewares.yml, media/nginx.conf,
 #         scripts/deploy.sh, scripts/rollback.sh, scripts/lib/*, postgres,
-#         redis, traefik, the socket proxy, and a host-network nginx standing
-#         in for the server's edge.
+#         redis, traefik, and the socket proxy. Traefik is the edge here
+#         exactly as it is in production -- it owns both ports and terminates
+#         TLS, and there is no nginx in front of it to stand in for.
 #   stand-in: ONLY the two application images (scripts/e2e/*-standin). They are
-#         built and tagged as ghcr.io/etqan-agency/chatbot/{api,dashboard} so
+#         built and tagged as ghcr.io/etqan-agency/chatbot-zaychain/{api,dashboard} so
 #         the compose file runs BYTE-FOR-BYTE UNMODIFIED against them, and they
 #         implement the contract the compose file and services.sh demand -- a
 #         drain-aware /health/, a manage.py, a warm-shutdown celery.
+#
+# TWO things are rewritten in the throwaway copies, both announced when they
+# happen, and both confined to $WORK:
+#   * traefik.yml gains a `caServer` pointing at a dead local address, so the
+#     configured ACME resolver is exercised without ever calling Let's Encrypt
+#     for hostnames that do not resolve. Traefik serves its self-signed
+#     default certificate meanwhile, which is why every probe passes -k.
+#   * the compose file's published ports, ONLY when 80/443 are already in use
+#     on this machine. The container ports stay 80 and 443 either way, so
+#     assert_edge_publication sees exactly what it sees in production.
 #
 # scripts/lib/rollout.test.sh stubs `docker` and proves the primitives in
 # isolation. This proves the things a stub cannot: that Traefik really
 # host-routes to these labels, that the drain gate really removes a backend,
 # that a roll really serves continuously, that `pg_dump | gzip` really reports
-# its failures, and that the vhosts we ship really parse.
+# its failures, and that Traefik really terminates TLS and redirects :80.
 #
 # COST AND BLAST RADIUS -- read before running locally:
 #   * The compose project name is pinned to `chatbot` and cannot be changed for
@@ -28,7 +39,8 @@
 #     into `chatbot-traefik-1`, and traefik.yml names the `chatbot_default`
 #     network. So this uses the SAME project as a local stack, and it refuses to
 #     start while any container of that project exists.
-#   * It binds host ports 80, 443 and 127.0.0.1:8081.
+#   * It binds host ports 80 and 443 (or a high fallback pair if those are
+#     taken).
 #   * Teardown removes the containers but KEEPS the named volumes. It therefore
 #     runs against whatever `chatbot_pgdata` already holds, and its backups land
 #     in the existing `chatbot_pgbackups` -- where deploy.sh's own 14-file
@@ -65,10 +77,9 @@ check() { # check <label> <expected> <actual>
 }
 note() { printf '\n=== %s\n' "$1"; }
 
-IMAGE_API=ghcr.io/etqan-agency/chatbot/api
-IMAGE_DASH=ghcr.io/etqan-agency/chatbot/dashboard
+IMAGE_API=ghcr.io/etqan-agency/chatbot-zaychain/api
+IMAGE_DASH=ghcr.io/etqan-agency/chatbot-zaychain/dashboard
 COMPOSE=docker-compose.production.yml
-EDGE=chatbot-e2e-edge
 WORK=""
 
 # --- teardown ---------------------------------------------------------------
@@ -76,11 +87,10 @@ cleanup() {
   local rc=$?
   if [ "$KEEP" = true ]; then
     echo; echo "--keep: leaving the stack up. Work dir: ${WORK}"
-    echo "  tear down with: docker rm -f ${EDGE}; (cd ${WORK} && docker compose -f ${COMPOSE} down)"
+    echo "  tear down with: (cd ${WORK} && docker compose -f ${COMPOSE} down)"
     return $rc
   fi
   echo; echo ">>> tearing down"
-  docker rm -f "$EDGE" >/dev/null 2>&1 || true
   if [ -n "$WORK" ] && [ -f "$WORK/$COMPOSE" ]; then
     local down_args=(down --remove-orphans)
     [ "$PURGE" = true ] && down_args=(down -v --remove-orphans)
@@ -103,7 +113,6 @@ trap cleanup EXIT
 note "0. preflight"
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 1; }
 docker compose version >/dev/null 2>&1 || { echo "docker compose v2 is required" >&2; exit 1; }
-command -v openssl >/dev/null || { echo "openssl is required (self-signed edge certificate)" >&2; exit 1; }
 
 existing=$(docker ps -aq --filter "label=com.docker.compose.project=chatbot" | wc -l)
 if [ "$existing" -ne 0 ]; then
@@ -119,30 +128,35 @@ if [ "$existing" -ne 0 ]; then
 fi
 port_free() { ! (exec 3<>"/dev/tcp/127.0.0.1/${1}") 2>/dev/null; }
 
-# The edge wants 80/443 -- those are the ports the shipped vhosts declare and
-# the ones a server uses. A developer machine often has something else on them
-# already, so fall back to a high pair rather than refusing: every URL and Host
-# header stays identical either way, because the probes reach the fallback with
-# `curl --connect-to` rather than by putting a port in the URL. Only the two
-# `listen` lines differ from the shipped file, and only in the fallback case.
-EDGE_HTTP=""; EDGE_HTTPS=""
+# Traefik wants 80/443 -- it is the edge, and those are the ports the compose
+# file publishes on a server. A developer machine often has something else on
+# them already, so fall back to a high pair rather than refusing: every URL and
+# Host header stays identical either way, because the probes reach the fallback
+# with `curl --connect-to` rather than by putting a port in the URL.
+#
+# Only the HOST side of the two `ports:` mappings differs from the shipped
+# compose file, and only in the fallback case. The CONTAINER ports stay 80 and
+# 443, so `docker port` -- and therefore assert_edge_publication -- reports
+# exactly what it reports in production.
+GW_HTTP=""; GW_HTTPS=""
 for pair in "80 443" "8080 8443" "9080 9443" "18080 18443"; do
   # shellcheck disable=SC2086  # the pair is a deliberate word-split argument list
   set -- $pair
-  if port_free "$1" && port_free "$2"; then EDGE_HTTP="$1"; EDGE_HTTPS="$2"; break; fi
+  if port_free "$1" && port_free "$2"; then GW_HTTP="$1"; GW_HTTPS="$2"; break; fi
 done
-if [ -z "$EDGE_HTTP" ]; then
-  echo "ERROR: no candidate port pair is free for the edge nginx." >&2
+if [ -z "$GW_HTTP" ]; then
+  echo "ERROR: no candidate port pair is free for the traefik gateway." >&2
   echo "       Tried 80/443, 8080/8443, 9080/9443, 18080/18443." >&2
   exit 1
 fi
-if [ "$EDGE_HTTP" = 80 ]; then
-  echo "docker, openssl, ports 80/443 free, no competing chatbot project"
+if [ "$GW_HTTP" = 80 ]; then
+  echo "docker, ports 80/443 free, no competing chatbot project"
 else
-  echo "NOTE: 80/443 are in use, so the edge binds ${EDGE_HTTP}/${EDGE_HTTPS} instead."
-  echo "      The vhosts' listen lines are rewritten to match; nothing else changes,"
-  echo "      and every request still carries the production URL and Host header,"
-  echo "      because the probes remap the transport with curl --connect-to."
+  echo "NOTE: 80/443 are in use, so traefik publishes ${GW_HTTP}/${GW_HTTPS} instead."
+  echo "      Only the host side of the compose file's \`ports:\` is rewritten;"
+  echo "      the container ports stay 80/443, and every request still carries the"
+  echo "      production URL and Host header, because the probes remap the"
+  echo "      transport with curl --connect-to."
 fi
 
 if docker volume inspect chatbot_pgdata >/dev/null 2>&1; then
@@ -152,30 +166,17 @@ if docker volume inspect chatbot_pgdata >/dev/null 2>&1; then
   echo "      left by an earlier run. Pass --purge for a clean volume."
 fi
 
-# Hostnames come from the SHIPPED vhosts, not from a constant here: if
-# .env.example and docs/nginx/ ever name different hosts, the deploy smoke
-# checks would probe a name the edge does not serve. Assert they agree.
-API_HOST=$(sed -n 's/^    server_name \(.*\);/\1/p' docs/nginx/api.chatbot-demo.conf | head -1)
-APP_HOST=$(sed -n 's/^    server_name \(.*\);/\1/p' docs/nginx/app.chatbot-demo.conf | head -1)
-env_api=$(sed -n 's/^API_HOST=//p' .env.example | head -1)
-env_app=$(sed -n 's/^APP_HOST=//p' .env.example | head -1)
-check "the api vhost and .env.example name the same host" "$env_api" "$API_HOST"
-check "the app vhost and .env.example name the same host" "$env_app" "$APP_HOST"
-[ -n "$API_HOST" ] && [ -n "$APP_HOST" ] || { echo "could not read server_name from the vhosts" >&2; exit 1; }
-
-# The two vhosts must stay identical apart from the hostname and the one-line
-# description. Their headers say "keep the two copies in sync by hand" and
-# nothing else checks it -- so the copy that was NOT edited silently keeps the
-# old, wrong reasoning. That is exactly how the IPv6 sorting argument came to
-# name the wrong file in one of them.
-# Substitute the short prefix, not the FQDN: the header abbreviates the
-# hostname as `api.chatbot-demo...` in prose, which an FQDN substitution leaves
-# untouched -- so the check would report drift on the exact sentence it exists
-# to police. `1d` drops the one line that is legitimately different, each
-# file's "chatbot API"/"chatbot dashboard" description.
-drift=$(diff <(sed -e "s/api\.chatbot-demo/HOST/g" -e '1d' docs/nginx/api.chatbot-demo.conf) \
-             <(sed -e "s/app\.chatbot-demo/HOST/g" -e '1d' docs/nginx/app.chatbot-demo.conf) | wc -l)
-check "the two vhosts are in sync modulo the hostname" "0" "$drift"
+# .env.example is now the ONLY place the hostnames are written -- the vhosts
+# that used to be the second copy are gone with the nginx layer, and with them
+# the whole class of "the two files name different hosts" bug. The compose
+# file's router rules read ${API_HOST}/${APP_HOST} from the same .env, so
+# there is nothing left to cross-check them against.
+API_HOST=$(sed -n 's/^API_HOST=//p' .env.example | head -1)
+APP_HOST=$(sed -n 's/^APP_HOST=//p' .env.example | head -1)
+[ -n "$API_HOST" ] && [ -n "$APP_HOST" ] || {
+  echo "could not read API_HOST/APP_HOST from .env.example" >&2; exit 1; }
+check "a hostname was read for the api router" "1" "$([ -n "$API_HOST" ] && echo 1 || echo 0)"
+check "a hostname was read for the app router" "1" "$([ -n "$APP_HOST" ] && echo 1 || echo 0)"
 
 # --- 1. build the stand-ins -------------------------------------------------
 note "1. building stand-in images"
@@ -202,59 +203,48 @@ MEDIA_PROBE_PATH=$(sed -n 's/^MEDIA_PROBE_PATH=//p' "$WORK/.env" | head -1)
 MEDIA_PROBE_PATH="${MEDIA_PROBE_PATH:-probe/health.txt}"
 echo "work dir: ${WORK}"
 
-# --- 3. the edge: the REAL vhosts, uncommented, against a self-signed cert ---
-note "3. edge nginx, from the shipped vhosts"
-mkdir -p "$WORK/edge/conf.d" "$WORK/edge/letsencrypt" "$WORK/edge/www"
-for host in "$API_HOST" "$APP_HOST"; do
-  mkdir -p "$WORK/edge/letsencrypt/live/${host}"
-  openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
-    -keyout "$WORK/edge/letsencrypt/live/${host}/privkey.pem" \
-    -out    "$WORK/edge/letsencrypt/live/${host}/fullchain.pem" \
-    -subj "/CN=${host}" -addext "subjectAltName=DNS:${host}" >/dev/null 2>&1
-done
-for pair in "api.chatbot-demo api" "app.chatbot-demo app"; do
-  # shellcheck disable=SC2086  # the pair is a deliberate word-split argument list
-  set -- $pair
-  bash scripts/e2e/uncomment-tls.sh "docs/nginx/${1}.conf" \
-    | sed -e "s/^\( *\)listen 80;/\1listen ${EDGE_HTTP};/" \
-          -e "s/^\( *\)listen 443 ssl http2;/\1listen ${EDGE_HTTPS} ssl http2;/" \
-    > "$WORK/edge/conf.d/${2}.conf"
-done
-# Two listen lines per file, two files: the :80 block and the :443 block of
-# each vhost must both have landed on the edge's ports, or the probes below
-# would be reaching something other than what was rendered.
-check "the rendered vhosts declare the edge's ports" "4" \
-  "$(cat "$WORK"/edge/conf.d/*.conf | grep -cE "^ *listen (${EDGE_HTTP};|${EDGE_HTTPS} ssl)" || true)"
+# --- 3. the gateway: real traefik.yml, ACME pointed at a dead CA ------------
+note "3. traefik as the edge"
 
-# NOTE what is deliberately ABSENT from $WORK/edge/letsencrypt: certbot's
-# options-ssl-nginx.conf and ssl-dhparams.pem. Those are written by certbot's
-# nginx INSTALLER, and the runbook issues certificates with `certonly
-# --webroot`, which runs no installer -- so on a real host following that
-# runbook they do not exist either. A vhost that `include`s them fails
-# `nginx -t` here exactly as it would there. That is the regression this
-# directory's emptiness encodes; do not "fix" it by adding the files.
-installer_files=0
-for f in "$WORK/edge/letsencrypt/options-ssl-nginx.conf" \
-         "$WORK/edge/letsencrypt/ssl-dhparams.pem"; do
-  [ -e "$f" ] && installer_files=$((installer_files + 1))
-done
-check "certbot's installer-only files are absent, as on a --webroot host" "0" "$installer_files"
+# The ONE line that differs from the shipped traefik.yml. The resolver itself
+# is left exactly as production declares it -- entrypoint, storage,
+# httpChallenge -- so the wiring under test is the real wiring. Only the CA it
+# talks to is moved, to an address nothing listens on.
+#
+# Without this, every start of this rehearsal would fire real HTTP-01 orders at
+# Let's Encrypt for two hostnames that do not resolve and a challenge it cannot
+# reach. Those are FAILED authorisations, and the production CA allows five per
+# account per hostname per hour -- so a few runs would lock the account out of
+# issuing certificates for real. It is not a slow path or a noisy log; it is a
+# rate limit spent on a test.
+sed -e 's#^      storage: /etc/traefik/acme/acme.json#&\n      caServer: https://127.0.0.1:1/directory#' \
+  traefik/traefik.yml > "$WORK/traefik/traefik.yml"
+check "the rehearsal traefik.yml points ACME at a dead CA" "1" \
+  "$(grep -c 'caServer: https://127.0.0.1:1/directory' "$WORK/traefik/traefik.yml" || true)"
+# The sed is an insertion keyed off a literal path. If that line is ever
+# reworded the substitution silently does nothing, the check above fails, and
+# this says why rather than leaving a confusing ACME failure later.
+# Anchored to the config KEY, not the word: traefik.yml discusses httpChallenge
+# in prose as well, so a bare grep counts the comment and reports 2.
+check "the resolver is otherwise untouched" "1" \
+  "$(grep -cE '^      httpChallenge:$' "$WORK/traefik/traefik.yml" || true)"
 
-docker run --rm -v "$WORK/edge/conf.d:/etc/nginx/conf.d:ro" \
-  -v "$WORK/edge/letsencrypt:/etc/letsencrypt:ro" \
-  nginx:alpine nginx -t >"$WORK/nginx-t.log" 2>&1
-nginx_t_rc=$?
-check "the shipped vhosts pass nginx -t with the :443 block enabled" "0" "$nginx_t_rc"
-# Gated on THIS check, not the suite-wide counter: keyed off $FAIL it printed
-# the log whenever anything earlier had failed, burying the real diagnostic.
-[ "$nginx_t_rc" -eq 0 ] || { echo "--- nginx -t said:"; cat "$WORK/nginx-t.log"; }
+# Traefik serves a self-signed certificate of its own for any host it has no
+# real certificate for, which is every host here. That is why every probe in
+# this script passes -k, and why no certificate material is generated.
 
-docker run -d --name "$EDGE" --network host \
-  -v "$WORK/edge/conf.d:/etc/nginx/conf.d:ro" \
-  -v "$WORK/edge/letsencrypt:/etc/letsencrypt:ro" \
-  -v "$WORK/edge/www:/var/www/html:ro" \
-  nginx:alpine >/dev/null
-echo "edge nginx up on :80/:443 (host network, so the vhosts' 127.0.0.1:8081 reaches Traefik)"
+if [ "$GW_HTTP" != 80 ]; then
+  # Host side only. See the port-selection comment above for why the container
+  # ports must not move.
+  sed -i -e "s/^      - \"80:80\"$/      - \"${GW_HTTP}:80\"/" \
+         -e "s/^      - \"443:443\"$/      - \"${GW_HTTPS}:443\"/" \
+    "$WORK/$(basename "$COMPOSE")"
+  check "the rewritten compose file publishes the fallback ports" "2" \
+    "$(grep -cE "^      - \"(${GW_HTTP}:80|${GW_HTTPS}:443)\"$" "$WORK/$(basename "$COMPOSE")" || true)"
+  check "the container ports were NOT rewritten" "2" \
+    "$(grep -cE "^      - \"[0-9]+:(80|443)\"$" "$WORK/$(basename "$COMPOSE")" || true)"
+fi
+echo "traefik will publish ${GW_HTTP}->80 and ${GW_HTTPS}->443"
 
 # --- helpers ----------------------------------------------------------------
 # rollout.sh's own primitives, used here to OBSERVE the system rather than to
@@ -268,10 +258,10 @@ source "$WORK/scripts/lib/rollout.sh"
 # `:8443` into every URL -- which would change the Host header, the redirect
 # target and the smoke probes' own URLs. --connect-to remaps address AND port
 # while leaving the request exactly as production issues it.
-CONNECT=(--connect-to "${API_HOST}:443:127.0.0.1:${EDGE_HTTPS}"
-         --connect-to "${APP_HOST}:443:127.0.0.1:${EDGE_HTTPS}"
-         --connect-to "${API_HOST}:80:127.0.0.1:${EDGE_HTTP}"
-         --connect-to "${APP_HOST}:80:127.0.0.1:${EDGE_HTTP}")
+CONNECT=(--connect-to "${API_HOST}:443:127.0.0.1:${GW_HTTPS}"
+         --connect-to "${APP_HOST}:443:127.0.0.1:${GW_HTTPS}"
+         --connect-to "${API_HOST}:80:127.0.0.1:${GW_HTTP}"
+         --connect-to "${APP_HOST}:80:127.0.0.1:${GW_HTTP}")
 
 # Status code and the serving generation, in one request. The release marker is
 # what makes "the roll actually swapped generations" an observation instead of
@@ -335,7 +325,11 @@ start_probe() { # start_probe <name> <url>  -- sets PROBE_PID
 # into the abrupt stop the drain exists to replace.
 if [ "$FAST" = true ]; then export DRAIN_SETTLE_SECS=7; else export DRAIN_SETTLE_SECS=15; fi
 export HEALTH_TIMEOUT_SECS=90 BACKEND_TIMEOUT_SECS=60
-export SMOKE_CURL_EXTRA="-k --connect-to ${API_HOST}:443:127.0.0.1:${EDGE_HTTPS} --connect-to ${APP_HOST}:443:127.0.0.1:${EDGE_HTTPS}"
+# The :80 entry is new and not optional. smoke_probes now emits two cleartext
+# redirect probes against http://127.0.0.1/, and without a --connect-to for
+# 127.0.0.1:80 they would reach whatever happens to hold port 80 on this
+# machine -- or nothing -- instead of the gateway under test.
+export SMOKE_CURL_EXTRA="-k --connect-to ${API_HOST}:443:127.0.0.1:${GW_HTTPS} --connect-to ${APP_HOST}:443:127.0.0.1:${GW_HTTPS} --connect-to 127.0.0.1:80:127.0.0.1:${GW_HTTP}"
 
 # --- 4. first bring-up, by hand (DEPLOY.md step 8) --------------------------
 note "4. bringing the stack up at e2e-v1"
@@ -348,8 +342,8 @@ IMAGE_TAG=e2e-v1 docker compose -f "$COMPOSE" run --rm --no-deps -l traefik.enab
 
 wait_for_200 "https://${API_HOST}/" 90
 wait_for_200 "https://${APP_HOST}/" 90
-check "the api host serves through the edge" "200 e2e-v1" "$(probe "https://${API_HOST}/")"
-check "the app host serves through the edge" "200 e2e-v1" "$(probe "https://${APP_HOST}/")"
+check "the api host serves through traefik" "200 e2e-v1" "$(probe "https://${API_HOST}/")"
+check "the app host serves through traefik" "200 e2e-v1" "$(probe "https://${APP_HOST}/")"
 check "the api health route is 200 when not draining" "200" \
   "$(probe "https://${API_HOST}/health/" | cut -d' ' -f1)"
 
@@ -361,20 +355,28 @@ check "the media router wins on the api host" "200" \
 check "media is served by the media container, not web" "none" \
   "$(probe "https://${API_HOST}/media/${MEDIA_PROBE_PATH}" | cut -d' ' -f2)"
 
-# The :80 block's redirect lives in `location /`, not at server level, so that
-# it cannot swallow the ACME challenge. Both halves are asserted: a plain path
-# must redirect, and the challenge path must NOT -- a server-level `return 301`
-# passes the first and fails the second, and every renewal would then fail.
+# Traefik's :80 entrypoint carries a blanket redirection to web-secure, and its
+# ACME http-01 handler is registered on that SAME entrypoint at a higher
+# priority. Both halves are asserted, because the whole topology depends on
+# that priority ordering being real rather than assumed: a plain path must
+# redirect, and the challenge path must NOT. If the redirect ever won, nothing
+# would look broken -- every user is on https already -- and certificate
+# renewal would simply stop, failing everywhere at once up to 60 days later.
+#
+# 404 (not 200) is the pass for the challenge: the handler is answering, and it
+# has no token by that name. A 301 here is the failure this guards against.
 check "http redirects to https" "301" \
   "$(curl -s -o /dev/null -w '%{http_code}' "${CONNECT[@]}" "http://${API_HOST}/some/path")"
 check "the ACME challenge path is NOT redirected" "404" \
   "$(curl -s -o /dev/null -w '%{http_code}' "${CONNECT[@]}" \
      "http://${API_HOST}/.well-known/acme-challenge/probe")"
 
-# Traefik must be reachable on loopback only. assert_loopback_publication
-# proves the binding; this proves the binding does what it claims.
-check "the gateway answers on loopback with a Host header" "200" \
-  "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${API_HOST}" http://127.0.0.1:8081/)"
+# Traefik terminates TLS itself here. assert_edge_publication proves the
+# ports are published; this proves the https port actually serves the router,
+# which is a different claim -- a published port with no certificate and no
+# matching router answers the TCP connect and then fails the handshake.
+check "the gateway serves https directly, with no nginx in front" "200" \
+  "$(curl -sk -o /dev/null -w '%{http_code}' "${CONNECT[@]}" "https://${API_HOST}/")"
 
 # --- 5. the drain gate ------------------------------------------------------
 # services.sh marks `web` drainable=true, and retire_container's settle window
@@ -505,18 +507,26 @@ check "with pipefail the same failure surfaces" "1" \
      </dev/null >/dev/null 2>&1; echo $?)"
 
 # --- 8. a failed smoke check must auto-roll-back ----------------------------
-# The lever is the edge, not the application: stopping it makes the three
-# public probes fail while the two loopback probes still pass. That is both the
-# easiest failure to induce and the exact scenario the loopback probes were
-# added for -- "public fails, loopback passes" means the gateway is broken, not
-# the release. deploy.sh rolls back on any smoke failure either way, which is
-# the behaviour under test here.
+# The lever is the TRANSPORT, not the application and not the gateway.
+#
+# There used to be an edge nginx to stop, which failed the public probes while
+# leaving the loopback ones passing. Neither exists now: Traefik is the only
+# layer, and stopping it would fail the PREFLIGHT (traefik_backends_up) rather
+# than the smoke checks -- a different branch of deploy.sh entirely, and not
+# the one under test.
+#
+# So point the smoke probes' own transport at a closed port. Port 1 is
+# privileged and unused, so every probe gets a connection refusal and curl
+# reports 000. The stack itself is untouched and healthy throughout, which is
+# exactly the shape of the failure this branch exists for: the release is fine,
+# the deploy could not verify it, and it must roll back anyway rather than
+# record a success it did not observe.
 note "8. auto-rollback on a failed smoke check"
 current_before=$(sed -n 's/^CURRENT=//p' .release-state | head -1)
 check "phase 8 starts from the release phase 6 recorded" "e2e-v2" "$current_before"
-docker stop "$EDGE" >/dev/null
 rollback_log="$WORK/deploy-v3.log"
-bash scripts/deploy.sh e2e-v3 --skip-pull --skip-backup </dev/null >"$rollback_log" 2>&1
+SMOKE_CURL_EXTRA="-k --connect-to ${API_HOST}:443:127.0.0.1:1 --connect-to ${APP_HOST}:443:127.0.0.1:1 --connect-to 127.0.0.1:80:127.0.0.1:1" \
+  bash scripts/deploy.sh e2e-v3 --skip-pull --skip-backup </dev/null >"$rollback_log" 2>&1
 check "a failed smoke check fails the deploy" "1" "$?"
 check "it rolls back to CURRENT, the tag that was serving" "1" \
   "$(grep -c 'rolling back to e2e-v2' "$rollback_log" || true)"
@@ -525,11 +535,12 @@ check "it does NOT roll back to PREVIOUS" "0" \
 check "release state is NOT advanced past a failed deploy" "0" \
   "$(grep -c 'CURRENT=e2e-v3' .release-state || true)"
 
-docker start "$EDGE" >/dev/null
 wait_for_200 "https://${API_HOST}/" 60
 # The rollback ran to completion even though its own verification could not
-# pass while the edge was down: the images reverted, which is what matters.
-check "the reverted generation is serving once the edge is back" "200 e2e-v2" \
+# pass through the sabotaged transport: the images reverted, which is what
+# matters. These probes use the REAL transport again, so they observe the
+# stack as it actually stands.
+check "the reverted generation is serving over the real transport" "200 e2e-v2" \
   "$(probe "https://${API_HOST}/")"
 check "no e2e-v3 container survived the rollback" "0" \
   "$(docker ps --format '{{.Image}}' | grep -c 'e2e-v3' || true)"

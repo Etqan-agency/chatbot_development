@@ -57,8 +57,8 @@ echo ">>> preflight"
 avail_mb=$(free -m | awk '/Mem:/ {print $7}')
 [ "$avail_mb" -ge 1200 ] || { echo "only ${avail_mb}MiB available; refusing" >&2; exit 1; }
 echo "available memory: ${avail_mb}MiB"
-assert_loopback_publication || exit 1
-echo "traefik published on loopback only"
+assert_edge_publication || exit 1
+echo "traefik publishes 80 and 443 to the world"
 
 # Before the API check below, deliberately: a stale traefik.yml is a common
 # CAUSE of that check failing, and "your gateway is running last week's config"
@@ -66,30 +66,15 @@ echo "traefik published on loopback only"
 assert_gateway_config_applied traefik/traefik.yml || exit 1
 echo "traefik is running its current static configuration"
 
-# Host vhost drift. WARNS rather than refusing, unlike the gateway check above,
-# and the difference is deliberate.
+# There is no host-vhost drift check here any more, and nothing is missing.
 #
-# A stale traefik.yml makes THIS DEPLOY report a success it did not achieve --
-# the config change it was supposed to apply is not applied -- so refusing is
-# the only honest answer. A drifted vhost does not: the deploy is real either
-# way, and the mismatch is between the server and the repository's reference
-# copy of a file the pipeline cannot deploy. Blocking on it would put a
-# documentation reconciliation in the path of an urgent release, which is
-# precisely when someone edits a vhost on the server in the first place.
+# It existed because the host nginx's vhosts lived outside DEPLOY_PATH, were
+# root-owned, and so could not be deployed by CD -- they were kept in step with
+# docs/nginx/ by hand, and drifted silently when they were not. Traefik owns
+# the edge now: its entire configuration is traefik/ and the compose labels,
+# both of which CD syncs and both of which drift loudly. There is no
+# hand-maintained copy left to disagree with.
 #
-# So: loud on every deploy, and `bash scripts/check-vhost-drift.sh` exits
-# non-zero on its own for anyone who wants it as a gate.
-check_out=$(bash scripts/check-vhost-drift.sh --quiet 2>&1) && drift_rc=0 || drift_rc=$?
-case "$drift_rc" in
-  0) echo "host vhosts match docs/nginx/" ;;
-  1) echo "WARNING: the host vhosts and docs/nginx/ disagree:" >&2
-     printf '%s\n' "$check_out" >&2 ;;
-  # Distinct from drift on purpose. "Could not check" reported as "disagree"
-  # sends the reader to reconcile two files that were never compared.
-  *) echo "WARNING: could not check the host vhosts against docs/nginx/:" >&2
-     printf '%s\n' "$check_out" >&2 ;;
-esac
-
 # The rolling swap health-gates on Traefik's API. That API is enabled by a
 # traefik.yml change that does NOT hot-reload -- it needs a manual container
 # restart. Without this check the deploy would get all the way past migrate and
@@ -230,7 +215,8 @@ smoke_failed=false
 while IFS= read -r probe; do
   url=${probe%%|*}; rest=${probe#*|}
   want=${rest%%|*}
-  # Third field is the Host header, present only on the loopback probes. When
+  # Third field is the Host header, present only on the :80 redirect probes.
+  # When
   # the probe has only two fields, `rest` has no second `|` and `${rest#*|}`
   # returns `rest` unchanged -- hence the equality test rather than a -z test.
   host=${rest#*|}; [ "$host" = "$want" ] && host=""

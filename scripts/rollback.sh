@@ -172,7 +172,8 @@ echo ">>> verifying"
 while IFS= read -r probe; do
   url=${probe%%|*}; rest=${probe#*|}
   want=${rest%%|*}
-  # Third field is the Host header, present only on the loopback probes. When
+  # Third field is the Host header, present only on the :80 redirect probes.
+  # When
   # the probe has only two fields, `rest` has no second `|` and `${rest#*|}`
   # returns `rest` unchanged -- hence the equality test rather than a -z test.
   host=${rest#*|}; [ "$host" = "$want" ] && host=""

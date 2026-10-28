@@ -133,14 +133,14 @@ reset_stub() { # reset_stub <api-json> [ps-lines...]
   : > "$STUB_DIR/health"
   echo healthy > "$STUB_DIR/health_default"
   rm -f "$STUB_DIR/stop_noop"
-  printf '80/tcp -> 127.0.0.1:8081\n' > "$STUB_DIR/port"
+  printf '80/tcp -> 0.0.0.0:80\n443/tcp -> 0.0.0.0:443\n' > "$STUB_DIR/port"
   echo 0 > "$STUB_DIR/pg_dump_rc"
   echo 0 > "$STUB_DIR/pull_rc"
   # Far future by default, so the gateway looks freshly started and the
   # static-config guard stays out of every other test's way.
   echo "2099-01-01T00:00:00Z" > "$STUB_DIR/started_at"
-  printf '%s\n' ghcr.io/etqan-agency/chatbot/api:rbtag \
-                ghcr.io/etqan-agency/chatbot/dashboard:rbtag > "$STUB_DIR/local_images"
+  printf '%s\n' ghcr.io/etqan-agency/chatbot-zaychain/api:rbtag \
+                ghcr.io/etqan-agency/chatbot-zaychain/dashboard:rbtag > "$STUB_DIR/local_images"
   : > "$STUB_DIR/up_creates"
   : > "$STUB_DIR/ps"
   [ "$#" -gt 0 ] && printf '%s\n' "$@" > "$STUB_DIR/ps"
@@ -387,6 +387,16 @@ echo "Mem: 1 2 3 4 5 4000"
 STUB
 cat > "$STUB_DIR/curl" <<'STUB'
 #!/usr/bin/env bash
+# The probe set is not uniform any more: smoke_probes wants 200 from the three
+# public https routes and 301 from the two cleartext :80 redirect probes. A
+# stub that answered 200 to everything would fail the deploy on its own
+# redirect check -- and, worse, would pass a build that had broken the
+# redirect.
+for a in "$@"; do
+  case "$a" in
+    http://*) echo 301; exit 0 ;;
+  esac
+done
 echo 200
 STUB
 chmod +x "$STUB_DIR/free" "$STUB_DIR/curl"
@@ -427,56 +437,99 @@ check "deploy.sh stopped no container" "0" \
 check "dashboard is untouched at 3 replicas" "3" \
   "$(grep -c '^chatbot-dashboard-' "$STUB_DIR/ps")"
 
-# --- the loopback-publication guard. Traefik published on anything but
-#     127.0.0.1 serves the whole stack in cleartext off-host, and every smoke
-#     probe still passes because they all request 127.0.0.1:8081 -- so the
-#     preflight is the only thing that can catch it. Both directions are
-#     asserted: the correct publication must NOT be refused, or the guard is a
-#     tripwire nobody can deploy past.
+# --- the edge-publication guard. Traefik owns 80/443 directly here, so the
+#     preflight is the only thing that can see three separate faults: a port
+#     confined to loopback (unreachable site, or -- for :80 -- certificate
+#     renewal that dies silently 60 days later), a missing port, and a stray
+#     publication of the API entrypoint. Both directions are asserted: the
+#     correct publication must NOT be refused, or the guard is a tripwire
+#     nobody can deploy past.
 setup_proj
 reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
   chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
 echo chatbot-worker-9 > "$STUB_DIR/up_creates"
 out=$(bash "$PROJ/scripts/deploy.sh" testtag --skip-backup 2>&1); rc=$?
-check "a loopback-published traefik passes the preflight" "0" "$rc"
+check "an edge-published traefik passes the preflight" "0" "$rc"
 check "the preflight says so" "1" \
-  "$(grep -c 'traefik published on loopback only' <<<"$out" || true)"
+  "$(grep -c 'traefik publishes 80 and 443 to the world' <<<"$out" || true)"
 
-for bind in "0.0.0.0:8081" "[::]:8081" "10.0.0.5:8081"; do
+# IPv6 is a legitimate public binding, not a fault. Docker renders it as
+# "[::]:443", which the address parser must not mistake for loopback.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+printf '80/tcp -> 0.0.0.0:80\n443/tcp -> [::]:443\n' > "$STUB_DIR/port"
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+out=$(bash "$PROJ/scripts/deploy.sh" testtag --skip-backup 2>&1); rc=$?
+check "an IPv6-published port is accepted as public" "0" "$rc"
+
+# A port confined to loopback. This is precisely the nginx topology's ports
+# entry, which an upstream merge can reinstate, so it is asserted for BOTH
+# ports rather than only the obvious one.
+for port in 80 443; do
+  addr=127.0.0.1
   setup_proj
   reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
     chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
-  printf '80/tcp -> %s\n' "$bind" > "$STUB_DIR/port"
+  if [ "$port" = 80 ]; then
+    printf '80/tcp -> 127.0.0.1:80\n443/tcp -> 0.0.0.0:443\n' > "$STUB_DIR/port"
+  else
+    printf '80/tcp -> 0.0.0.0:80\n443/tcp -> 127.0.0.1:443\n' > "$STUB_DIR/port"
+  fi
   # Same fixture as the passing case above, so the only difference between a
   # rc=0 and this rc=1 is the publication -- otherwise a refusal assertion
   # could be satisfied by an unrelated late failure.
   echo chatbot-worker-9 > "$STUB_DIR/up_creates"
   err=$(bash "$PROJ/scripts/deploy.sh" testtag --skip-backup 2>&1 >/dev/null); rc=$?
-  check "deploy.sh refuses a traefik published on ${bind}" "1" "$rc"
-  check "the refusal quotes the offending mapping (${bind})" "1" \
-    "$(grep -cF -- "80/tcp -> ${bind}" <<<"$err" || true)"
-  check "the refusal names the compose ports line (${bind})" "1" \
-    "$(grep -cF -- '- "127.0.0.1:8081:80"' <<<"$err" || true)"
-  check "it refused BEFORE pulling images (${bind})" "0" \
+  check "deploy.sh refuses port ${port} bound to ${addr}" "1" "$rc"
+  check "the refusal quotes the offending mapping (${port})" "1" \
+    "$(grep -cF -- "${port}/tcp -> ${addr}:${port}" <<<"$err" || true)"
+  check "the refusal names the compose ports lines (${port})" "1" \
+    "$(grep -cF -- '- "443:443"' <<<"$err" || true)"
+  check "it refused BEFORE pulling images (${port})" "0" \
     "$(grep -c '^compose -f .* pull' "$STUB_DIR/calls.log" || true)"
-  check "it refused BEFORE any mutation (${bind})" "0" \
+  check "it refused BEFORE any mutation (${port})" "0" \
     "$(grep -cE '^(stop|rm) |--scale' "$STUB_DIR/calls.log" || true)"
 done
 
-# A mixed publication -- one good mapping, one not -- must still refuse. A
-# check that only looked at the first line would let this through.
+# A MISSING port, as distinct from a loopback-bound one. :443 missing is
+# obvious; :80 missing is the dangerous one, because nothing user-facing
+# breaks and only certificate renewal dies.
 setup_proj
 reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
   chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
-printf '80/tcp -> 127.0.0.1:8081\n8080/tcp -> 0.0.0.0:8080\n' > "$STUB_DIR/port"
+printf '443/tcp -> 0.0.0.0:443\n' > "$STUB_DIR/port"
 echo chatbot-worker-9 > "$STUB_DIR/up_creates"
 err=$(bash "$PROJ/scripts/deploy.sh" testtag --skip-backup 2>&1 >/dev/null); rc=$?
-check "deploy.sh refuses when only ONE of two mappings is public" "1" "$rc"
-check "the refusal names the public mapping, not the loopback one" "1" \
+check "deploy.sh refuses when port 80 is not published" "1" "$rc"
+check "the refusal explains that renewal, not serving, is what breaks" "1" \
+  "$(grep -c 'RENEWING' <<<"$err" || true)"
+
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+printf '80/tcp -> 0.0.0.0:80\n' > "$STUB_DIR/port"
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+err=$(bash "$PROJ/scripts/deploy.sh" testtag --skip-backup 2>&1 >/dev/null); rc=$?
+check "deploy.sh refuses when port 443 is not published" "1" "$rc"
+check "the refusal says nothing is serving https" "1" \
+  "$(grep -c 'nothing serving https' <<<"$err" || true)"
+
+# A stray publication alongside two correct ones. A check that only verified
+# the two required ports were present would let this through.
+setup_proj
+reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
+  chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
+printf '80/tcp -> 0.0.0.0:80\n443/tcp -> 0.0.0.0:443\n8080/tcp -> 0.0.0.0:8080\n' \
+  > "$STUB_DIR/port"
+echo chatbot-worker-9 > "$STUB_DIR/up_creates"
+err=$(bash "$PROJ/scripts/deploy.sh" testtag --skip-backup 2>&1 >/dev/null); rc=$?
+check "deploy.sh refuses a stray publication beside the two public ports" "1" "$rc"
+check "the refusal names the stray mapping, not the correct ones" "1" \
   "$(grep -cF -- '8080/tcp -> 0.0.0.0:8080' <<<"$err" || true)"
 
 # No published ports at all is also a refusal: it means the ports: entry was
-# deleted, and nginx would then proxy to nothing.
+# deleted, and Traefik would then be serving nobody.
 setup_proj
 reset_stub "$FOUR_UP" chatbot-web-1 chatbot-web-2 \
   chatbot-dashboard-1 chatbot-dashboard-2 chatbot-worker-1
@@ -581,6 +634,16 @@ check "an empty PREVIOUS does not defeat the auto-rollback" "1" \
 # Restore the 200-returning curl stub for anything that follows.
 cat > "$STUB_DIR/curl" <<'STUB'
 #!/usr/bin/env bash
+# The probe set is not uniform any more: smoke_probes wants 200 from the three
+# public https routes and 301 from the two cleartext :80 redirect probes. A
+# stub that answered 200 to everything would fail the deploy on its own
+# redirect check -- and, worse, would pass a build that had broken the
+# redirect.
+for a in "$@"; do
+  case "$a" in
+    http://*) echo 301; exit 0 ;;
+  esac
+done
 echo 200
 STUB
 chmod +x "$STUB_DIR/curl"
@@ -611,7 +674,7 @@ check "a rollback to CURRENT leaves CURRENT at the target" "CURRENT=goodtag" \
 check "a rollback to CURRENT PRESERVES the older PREVIOUS" "PREVIOUS=oldertag" \
   "$(grep '^PREVIOUS=' "$PROJ/.release-state" || true)"
 
-# --- smoke_probes emits both public and loopback probes -------------------
+# --- smoke_probes emits both public https and :80 redirect probes ---------
 # smoke_probes lives in services.sh, which rollout.test.sh deliberately does
 # NOT source at top level (see the reconcile_command comment above: sourcing
 # it would give release_current a definition and change that test's result).
@@ -622,11 +685,16 @@ out=$(source ./services.sh && smoke_probes api.example.test app.example.test pro
 check "smoke_probes emits five probes" "5" "$(grep -c . <<<"$out")"
 check "three probes are public https" "3" \
   "$(grep -c '^https://' <<<"$out" || true)"
-check "two probes go straight at the gateway" "2" \
-  "$(grep -c '^http://127.0.0.1:8081' <<<"$out" || true)"
-check "the loopback probes carry a Host header field" "2" \
-  "$(grep -cE '^http://127\.0\.0\.1:8081[^|]*\|200\|[a-z.]+$' <<<"$out" || true)"
-# Both loopback lines carry the overridden gateway URL, hence 2, not 1.
+check "two probes exercise the :80 redirect" "2" \
+  "$(grep -c '^http://127.0.0.1/' <<<"$out" || true)"
+# 301 is the PASS for these, not 200. Asserted explicitly: a copy-paste that
+# left them at 200 would make the deploy auto-roll-back a perfectly good
+# release every time, and the suite must not agree that that is correct.
+check "the redirect probes want 301 and carry a Host header field" "2" \
+  "$(grep -cE '^http://127\.0\.0\.1/[^|]*\|301\|[a-z.]+$' <<<"$out" || true)"
+check "no probe expects a 200 from cleartext :80" "0" \
+  "$(grep -cE '^http://[^|]*\|200' <<<"$out" || true)"
+# Both redirect lines carry the overridden gateway URL, hence 2, not 1.
 # shellcheck source=SCRIPTDIR/services.sh
 check "the gateway URL is overridable" "2" \
   "$( { source ./services.sh; smoke_probes a.test b.test t.txt http://127.0.0.1:9999; } | grep -c '9999' || true)"
@@ -875,7 +943,7 @@ check "an empty value yields empty"         ""            "$(envval_at EMPTY)"
 # still refusing when they are NOT is what keeps it safe, because compose would
 # otherwise create containers that cannot start.
 # ---------------------------------------------------------------------------
-RB_JSON='{"services":{"web":{"image":"ghcr.io/etqan-agency/chatbot/api:rbtag"},"worker":{"image":"ghcr.io/etqan-agency/chatbot/api:rbtag"},"dashboard":{"image":"ghcr.io/etqan-agency/chatbot/dashboard:rbtag"}}}'
+RB_JSON='{"services":{"web":{"image":"ghcr.io/etqan-agency/chatbot-zaychain/api:rbtag"},"worker":{"image":"ghcr.io/etqan-agency/chatbot-zaychain/api:rbtag"},"dashboard":{"image":"ghcr.io/etqan-agency/chatbot-zaychain/dashboard:rbtag"}}}'
 
 # Baseline: a working registry still takes the ordinary path.
 setup_proj
@@ -916,12 +984,12 @@ printf '%s' "$RB_JSON" > "$STUB_DIR/compose_json"
 printf 'CURRENT=rbtag\nPREVIOUS=older\n' > "$PROJ/.release-state"
 echo 1 > "$STUB_DIR/pull_rc"
 # Only the api image is present; the dashboard image is not.
-printf '%s\n' ghcr.io/etqan-agency/chatbot/api:rbtag > "$STUB_DIR/local_images"
+printf '%s\n' ghcr.io/etqan-agency/chatbot-zaychain/api:rbtag > "$STUB_DIR/local_images"
 : > "$STUB_DIR/calls.log"
 err=$(bash "$PROJ/scripts/rollback.sh" rbtag 2>&1 >/dev/null); rc=$?
 check "a missing image with no registry refuses" "1" "$rc"
 check "the refusal names the missing image" "1" \
-  "$(grep -c 'MISSING: ghcr.io/etqan-agency/chatbot/dashboard:rbtag' <<<"$err" || true)"
+  "$(grep -c 'MISSING: ghcr.io/etqan-agency/chatbot-zaychain/dashboard:rbtag' <<<"$err" || true)"
 check "the refusal creates no container" "0" \
   "$(grep -cF -- '--scale' "$STUB_DIR/calls.log" || true)"
 check "the refusal stops no container" "0" \
@@ -953,151 +1021,10 @@ check "the undeterminable list creates no container" "0" \
   "$(grep -cF -- '--scale' "$STUB_DIR/calls.log" || true)"
 
 # ---------------------------------------------------------------------------
-# check-vhost-drift.sh: the two files CD cannot deploy.
-#
-# docs/nginx/*.conf are reference copies; the live vhosts are root-owned and
-# outside DEPLOY_PATH, so the pipeline syncs everything in this repository
-# EXCEPT those two, and they are the only files that can drift without anything
-# saying so.
-#
-# The check compares behaviour, not bytes -- see the script header for why a
-# byte diff is permanently and correctly red. These tests pin both halves of
-# that: it must ignore the differences that are legitimate, and it must catch
-# the ones that route traffic somewhere else.
+# The check-vhost-drift.sh suite lived here. It is gone with the script: the
+# host nginx it policed no longer exists, and Traefik's configuration is all
+# under traefik/ where CD syncs it and drift is impossible.
 # ---------------------------------------------------------------------------
-VHOST_DIR="$PROJ/vhost-live"
-
-# A minimal shipped vhost in the shape the real ones have: an active :80 block
-# and a commented-out :443 block that the install uncomments in step 3.
-write_repo_vhost() {
-  mkdir -p "$PROJ/docs/nginx"
-  cat > "$PROJ/docs/nginx/${1}.conf" <<EOF
-# Reference copy. Prose here must never be compared.
-#   proxy_pass http://127.0.0.1:9999;   <- a URL inside a comment
-server {
-    listen 80;
-    server_name ${2};
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-#server {
-#    listen 443 ssl;
-#    server_name ${2};
-#
-#    ssl_certificate /etc/letsencrypt/live/${2}/fullchain.pem;
-#    ssl_ciphers "ECDHE-RSA-AES128-GCM-SHA256";
-#
-#    client_max_body_size 25M;
-#    proxy_read_timeout 120s;
-#
-#    location / {
-#        proxy_pass http://127.0.0.1:8081;
-#        proxy_set_header Host \$host;
-#    }
-#}
-EOF
-}
-
-# The live counterpart: same behaviour, different TLS plumbing and comments.
-write_live_vhost() {
-  mkdir -p "$VHOST_DIR"
-  cat > "$VHOST_DIR/${2}" <<EOF
-# Installed by hand; comments differ and that is fine.
-server {
-    listen 80;
-    server_name ${2};
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-server {
-    listen 443 ssl;
-    server_name ${2};
-
-    ssl_certificate /etc/letsencrypt/live/${2}/fullchain.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
-
-    client_max_body_size 25M;
-    proxy_read_timeout 120s;
-
-    location / {
-        proxy_pass http://127.0.0.1:8081;
-        proxy_set_header Host \$host;
-    }
-}
-EOF
-}
-
-drift_check() { ( cd "$PROJ" && bash scripts/check-vhost-drift.sh --live-dir "$VHOST_DIR" 2>&1 ); }
-
-setup_proj
-rm -rf "$PROJ/docs/nginx" "$VHOST_DIR"
-write_repo_vhost api api.example.test
-write_live_vhost api api.example.test
-out=$(drift_check); rc=$?
-check "matching behaviour passes despite different TLS plumbing" "0" "$rc"
-check "an include-vs-inlined TLS difference is not drift" "0" \
-  "$(grep -c 'DRIFTED' <<<"$out" || true)"
-check "a comment containing a directive is not compared" "0" \
-  "$(grep -c '9999' <<<"$out" || true)"
-
-# The whole point: a proxy_pass edited on the server and never brought back.
-sed -i 's|proxy_pass http://127.0.0.1:8081;|proxy_pass http://127.0.0.1:9999;|' \
-  "$VHOST_DIR/api.example.test"
-out=$(drift_check); rc=$?
-check "a changed proxy_pass is drift" "1" "$rc"
-check "the report names both sides of the change" "1" \
-  "$(grep -c 'on server, not in repo: proxy_pass http://127.0.0.1:9999' <<<"$out" || true)"
-
-# A forwarded header dropped on the server: the rate limiters key tenant
-# identity off X-Forwarded-For, so losing it collapses every tenant into one
-# bucket -- silently, and with every request still returning 200.
-write_live_vhost api api.example.test
-sed -i '/proxy_set_header Host/d' "$VHOST_DIR/api.example.test"
-out=$(drift_check); rc=$?
-check "a dropped proxy_set_header is drift" "1" "$rc"
-check "the report says which side is missing it" "1" \
-  "$(grep -c 'in repo, not on server: proxy_set_header Host' <<<"$out" || true)"
-
-# A vhost this repository describes that nginx is not serving at all.
-write_live_vhost api api.example.test
-rm -f "$VHOST_DIR/api.example.test"
-out=$(drift_check); rc=$?
-check "a missing live vhost is an error, not a pass" "1" "$rc"
-check "it names the file it looked for" "1" \
-  "$(grep -c 'api.example.test does not exist' <<<"$out" || true)"
-
-# An already-uncommented reference copy cannot be installed on a fresh host --
-# nginx refuses a `listen 443 ssl` block whose certificate does not exist yet,
-# and takes every site on the host down with it.
-write_repo_vhost api api.example.test
-write_live_vhost api api.example.test
-sed -i 's/^#//' "$PROJ/docs/nginx/api.conf"
-out=$(drift_check)
-check "a reference copy shipped with TLS live is called out" "1" \
-  "$(grep -c 'no commented-out :443 block' <<<"$out" || true)"
-
-# "Could not check" must not read as "checked and found drift". This shipped
-# wrong once: CD synced traefik/, scripts/ and media/ to the server but not
-# docs/nginx/, so the check ran against nothing and deploy.sh reported the
-# vhosts as disagreeing -- pointing an operator at a reconciliation between two
-# files that had never been compared.
-setup_proj
-rm -rf "$PROJ/docs/nginx" "$VHOST_DIR"
-mkdir -p "$VHOST_DIR"
-out=$(drift_check); rc=$?
-check "no reference copies at all exits 2, not 1" "2" "$rc"
-check "it says nothing was compared" "1" \
-  "$(grep -c 'no vhosts compared' <<<"$out" || true)"
-check "it does not call that a disagreement" "0" \
-  "$(grep -c 'DRIFTED' <<<"$out" || true)"
-check "it names the sync as the likely cause" "1" \
-  "$(grep -c 'that sync is broken' <<<"$out" || true)"
-
-rm -rf "$PROJ/docs/nginx" "$VHOST_DIR"
-
 # ---------------------------------------------------------------------------
 # wait_backends_settled: EXACTLY `expected`, not "at least".
 #
@@ -1188,7 +1115,7 @@ assert_gateway_config_applied "$STUB_DIR/gw/traefik.yml" >/dev/null 2>&1
 check "an equal timestamp is not treated as drift" "0" "$?"
 
 # Inability to check must not block a deploy. The gateway being absent is
-# already caught, loudly, by assert_loopback_publication just above it.
+# already caught, loudly, by assert_edge_publication just above it.
 stage_gateway "2026-06-01T00:00:00Z" ""
 : > "$STUB_DIR/started_at"
 assert_gateway_config_applied "$STUB_DIR/gw/traefik.yml" >/dev/null 2>&1

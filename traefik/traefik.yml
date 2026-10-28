@@ -15,50 +15,73 @@ accessLog:
       names:
         User-Agent: keep
         Content-Type: keep
+        # The INBOUND header, which on this topology is client-supplied and
+        # therefore untrusted -- Traefik is the edge and overwrites it before
+        # forwarding (see the `web` entrypoint). It is kept because a request
+        # arriving with an XFF it has no business setting is a useful signal,
+        # not because it identifies anyone. The real peer address is the
+        # ClientAddr/ClientHost field, which defaultMode: keep already logs;
+        # read that one during an incident.
         X-Forwarded-For: keep
 
 entryPoints:
-  # Plaintext, and published on 127.0.0.1 only (see the ports: block in
-  # docker-compose.production.yml). The host's nginx terminates TLS and proxies
-  # here; nothing outside the host can reach this.
+  # Traefik is the edge. This is published on 0.0.0.0:80 and faces the public
+  # internet directly -- there is no nginx in front of it on this topology.
   #
-  # There is deliberately NO redirection to web-secure. nginx already redirects
-  # http->https at the edge, and a redirect here would bounce nginx's proxied
-  # request straight back to nginx, which re-proxies it: an infinite loop, and
-  # the first thing that breaks if this is reintroduced.
+  # There is deliberately NO `forwardedHeaders.trustedIPs` block here, and
+  # adding one is a security change, not a tuning knob. With no trusted
+  # sources configured, Traefik OVERWRITES X-Forwarded-* on every inbound
+  # request, which is the only correct behaviour for a process that terminates
+  # client connections itself: there is no upstream proxy whose word could be
+  # taken for the client's address.
+  #
+  # This inverts the previous topology, where nginx sat in front and its hop
+  # HAD to be trusted. Anyone restoring a trustedIPs block here from that
+  # history re-opens it: X-Forwarded-For becomes attacker-controlled, and the
+  # rate limiters in dynamic/middlewares.yml key tenant identity off exactly
+  # that header. See the matching note there -- the two settings are one
+  # decision and must not be changed independently.
   web:
     address: ":80"
-    forwardedHeaders:
-      # Traefik overwrites X-Forwarded-* from an untrusted source. Without this,
-      # every request looks like it came from nginx: the access log records the
-      # proxy's address instead of the client's, and the rate-limit middlewares
-      # key every tenant into ONE shared bucket.
-      #
-      # The value is the source address Traefik actually sees for a request
-      # arriving via a published port, which is NOT 127.0.0.1 -- Docker DNATs
-      # it and the container sees the bridge gateway. Measured empirically
-      # from Traefik's own access log against a live request; do not guess it.
-      trustedIPs:
-        - "127.0.0.1/32"
-        # A request through the published port arrives at Traefik as the
-        # bridge gateway address (172.18.0.1), not 127.0.0.1 -- Docker DNATs
-        # it. Pinned as a /32, not the /16 subnet: the gateway is always .1 of
-        # whatever subnet chatbot_default's IPAM assigns, so if the subnet
-        # ever moves this address moves with it -- a /16 would miss the new
-        # gateway exactly as a /32 would, and would additionally trust every
-        # OTHER container in chatbot_default (they can reach traefik:80
-        # directly, bypassing the published port entirely). Since XFF is what
-        # the rate limiter keys on, that would let a compromised web/worker/
-        # dashboard/media container forge X-Forwarded-For and steal or poison
-        # another tenant's bucket. A /32 grants none of that.
-        - "172.18.0.1/32"
+    # Everything public is https. The ACME HTTP-01 challenge still works
+    # through this redirect: Traefik installs the challenge handler on this
+    # entrypoint at a HIGHER priority than the redirection router, so
+    # /.well-known/acme-challenge/ is answered here and everything else is
+    # bounced. That ordering is what makes redirect + httpChallenge on the
+    # same entrypoint a supported combination rather than a deadlock.
+    #
+    # The previous topology forbade this redirect outright, because a redirect
+    # behind nginx bounced nginx's own proxied request back to nginx in an
+    # infinite loop. That reasoning died with the nginx layer; it is recorded
+    # here only so the old comment is not reinstated from git history.
+    http:
+      redirections:
+        entryPoint:
+          to: web-secure
+          scheme: https
+          permanent: true
 
-  # Dormant. Nothing routes here while nginx terminates TLS, and it is not
-  # published, so it binds only inside the container. Kept so that moving this
-  # stack to a host where Traefik owns 80/443 is a ports change plus four
-  # labels rather than a re-derivation.
+  # The public TLS entrypoint. Certificates are resolved here rather than per
+  # router: a router that forgets `tls.certresolver` on a per-router setup
+  # still matches and still serves, just over a default self-signed
+  # certificate -- a browser warning in production that no deploy-time check
+  # catches. Setting it on the entrypoint makes it structurally impossible to
+  # forget when adding a route.
   web-secure:
     address: ":443"
+    http:
+      tls:
+        certResolver: letsencrypt
+    transport:
+      respondingTimeouts:
+        # Carried over from the nginx vhosts' proxy_read_timeout /
+        # proxy_send_timeout, which were 120s. Traefik's own defaults are not
+        # the same (writeTimeout and readTimeout default to 0 = no timeout),
+        # so dropping the nginx layer without restating these silently removes
+        # the ceiling on a slow or stuck request.
+        readTimeout: 120s
+        writeTimeout: 120s
+        idleTimeout: 180s
 
   # Container-local ONLY. Traefik's API exposes the entire routing
   # configuration, so this must never bind 0.0.0.0 or be published: binding
@@ -74,19 +97,49 @@ api:
   dashboard: false
   insecure: true
 
-# DORMANT while nginx terminates TLS. ACME is on-demand: no router names a
-# certresolver and no `domains` are declared here, so Traefik never contacts
-# Let's Encrypt. It is kept, not deleted, because re-enabling it is the whole
-# difference between this topology and a Traefik-owned 80/443 one.
+# LIVE. Traefik owns 80/443 and issues its own certificates; there is no
+# certbot on the host. Issuance is on-demand and driven by the routers' Host()
+# rules -- no `domains` are declared here, so adding a hostname is a router
+# label and nothing else.
 #
-# If a router is ever given `tls.certresolver=letsencrypt` while Traefik is
-# behind nginx, the httpChallenge below will fail forever: it answers on the
-# `web` entrypoint, which is not publicly reachable.
+# `storage` is inside the traefik_acme volume, which is what makes issuance
+# survive a gateway recreate. Lose that volume and every certificate is
+# re-requested on the next start, against a rate limit that does not forgive
+# it (below).
+#
+# The email is per-deployment and MUST be changed by each fork. It is set here
+# rather than through an environment variable on purpose: Traefik's static
+# configuration comes from a file OR from environment variables OR from CLI
+# flags, and mixing them is not a documented merge. This file is the single
+# source, so nothing silently half-applies.
+#
+# WHEN TESTING, POINT caServer AT LET'S ENCRYPT STAGING by editing this file
+# (scripts/e2e.sh does exactly that to its own throwaway copy). The production
+# CA allows 5 failed authorisations per account per hostname per hour, and a
+# misconfigured DNS record or an unreachable :80 burns through that in one
+# sitting -- after which the host cannot get a certificate for the rest of the
+# hour no matter what you fix:
+#
+#   caServer: https://acme-staging-v02.api.letsencrypt.org/directory
+#
+# NOTE that the line above is a COMMENT, and a bare `grep caServer:` matches it.
+# Anything scripting the staging switch must anchor to the config key or it will
+# conclude the override is already applied and silently skip it -- which means
+# running against the PRODUCTION CA while believing otherwise:
+#
+#   grep -E '^\s+caServer:' traefik/traefik.yml
+#
+# Measured, not theorised: that exact mistake was made while provisioning the
+# first host on this topology.
 certificatesResolvers:
   letsencrypt:
     acme:
       email: etqan.agency.company@gmail.com
       storage: /etc/traefik/acme/acme.json
+      # HTTP-01, not TLS-ALPN-01 or DNS-01: it needs only a publicly reachable
+      # :80, which this topology already requires for the https redirect. See
+      # the `web` entrypoint for why the redirect does not swallow the
+      # challenge.
       httpChallenge:
         entryPoint: web
 
